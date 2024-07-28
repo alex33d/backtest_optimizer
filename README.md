@@ -36,7 +36,7 @@ To start using the Optimizer, you need to import the `ParameterOptimizer` class 
     optimizer = ParameterOptimizer(calc_pl)
     ```
 
-    - `calc_pl`: A function for calculating strategy profit and loss. It must accept a dictionary with data in the form `{ticker: DataFrame}`, and return the parameter you want to maximize (e.g., Sharpe ratio, returns).
+    - `calc_pl`: A function for calculating strategy profit and loss. It must accept a dictionary with data in the form `{ticker: DataFrame}`, and returns pandas Series with returns for each period.
 
 2. **Train/Test Split**:
 
