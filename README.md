@@ -26,8 +26,6 @@ pip install git+https://github.com/alex33d/backtest_optimizer.git
 
 ## Usage
 
-## Usage
-
 To start using the Optimizer, you need to import the `ParameterOptimizer` class from `backtest_optimizer/main.py`. The main functions are:
 
 1. **Initialize the Optimizer**:
