@@ -1,4 +1,4 @@
-# backtest_optimizer
+# Backtest Optimizer
 Optimization of trading strategy hyperparameters with combinatorial cross validation and stress tesing
 
 ## Table of Contents
