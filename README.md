@@ -142,3 +142,87 @@ best_params = optimizer.cluster_and_aggregate()
 
 # Calculate out-of-sample Sharpe ratio
 oos_sharpe = optimizer.calc_oos_sharpe(best_params)
+
+## Contributing
+
+We welcome contributions to the project! Here’s how you can help:
+
+### Reporting Issues
+
+If you find a bug or have a feature request, please create an issue on GitHub.
+
+1. Go to the [Issues](https://github.com/yourusername/my-python-project/issues) page.
+2. Click on the "New issue" button.
+3. Provide a clear and descriptive title.
+4. Describe the issue or feature request in detail, including steps to reproduce the issue if applicable.
+
+### Submitting Pull Requests
+
+If you want to contribute code, follow these steps to submit a pull request:
+
+1. **Fork the Repository**
+
+    Click the "Fork" button at the top right of the repository page to create a copy of the repository on your GitHub account.
+
+2. **Clone Your Fork**
+
+    Clone your forked repository to your local machine:
+
+    ```bash
+    git clone https://github.com/yourusername/my-python-project.git
+    cd my-python-project
+    ```
+
+3. **Create a Branch**
+
+    Create a new branch for your feature or bug fix:
+
+    ```bash
+    git checkout -b my-feature-branch
+    ```
+
+4. **Make Your Changes**
+
+    Make your changes to the codebase. Ensure your code follows the project's coding standards.
+
+5. **Commit Your Changes**
+
+    Commit your changes with a descriptive commit message:
+
+    ```bash
+    git add .
+    git commit -m "Description of your changes"
+    ```
+
+6. **Push to Your Fork**
+
+    Push your changes to your forked repository:
+
+    ```bash
+    git push origin my-feature-branch
+    ```
+
+7. **Create a Pull Request**
+
+    Go to the original repository on GitHub and click the "New pull request" button.
+
+    - Select your branch from the "compare" dropdown.
+    - Provide a clear and descriptive title for your pull request.
+    - Describe your changes in detail in the description field.
+    - Submit the pull request.
+
+### Coding Guidelines
+
+To maintain consistency in the codebase, please adhere to the following guidelines:
+
+- Follow the [PEP 8](https://www.python.org/dev/peps/pep-0008/) style guide for Python code.
+- Write descriptive commit messages.
+- Include docstrings for all functions and classes.
+- Write unit tests for new features and bug fixes.
+
+### Code of Conduct
+
+Please note that this project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior to [your.email@example.com](mailto:your.email@example.com).
+
+Thank you for contributing!
+
