@@ -737,6 +737,7 @@ def run_stress_tests(returns: pd.DataFrame, params: Dict[str, Any] = None) -> No
     top_n_strategies = params.get('top_n_strategies', 5)
 
     returns = returns.T.drop_duplicates().T
+    returns.columns = range(len(returns.columns))
     returns = returns.drop([col for col in returns.columns if returns[col].nunique() == 1], axis=1)
 
     logging.info('---')

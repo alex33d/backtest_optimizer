@@ -17,7 +17,7 @@ import matplotlib
 import itertools as itt
 
 from metrics import *
-from backtest_stress_tests import run_stress_tests
+from backtest_optimizer.backtest_stress_tests import run_stress_tests
 
 matplotlib.use('TkAgg')
 
@@ -149,11 +149,17 @@ class ParameterOptimizer:
         is_test_group = np.full((n, C_nk), fill_value=False)
         is_test = np.full((t_span, C_nk), fill_value=False)
 
-        for k, pair in enumerate(test_groups):
-            i, j = pair
-            is_test_group[[i, j], k] = True
-            mask = (group_num == i) | (group_num == j)
-            is_test[mask, k] = True
+        if k > 1:
+            for k, pair in enumerate(test_groups):
+                for i in pair:
+                    is_test_group[i, k] = True
+                    mask = (group_num == i)
+                    is_test[mask, k] = True
+        else:
+            for k, i in enumerate(test_groups.flatten()):
+                is_test_group[i, k] = True
+                mask = (group_num == i)
+                is_test[mask, k] = True
 
         path_folds = np.full((n, n_paths), fill_value=np.nan)
 
