@@ -142,10 +142,12 @@ best_params = optimizer.cluster_and_aggregate()
 
 # Calculate out-of-sample Sharpe ratio
 oos_sharpe = optimizer.calc_oos_sharpe(best_params)
+```
+
 
 ## Contributing
 
-We welcome contributions to the project! Here’s how you can help:
+I welcome contributions to the project! Here’s how you can help:
 
 ### Reporting Issues
 
@@ -169,8 +171,8 @@ If you want to contribute code, follow these steps to submit a pull request:
     Clone your forked repository to your local machine:
 
     ```bash
-    git clone https://github.com/yourusername/my-python-project.git
-    cd my-python-project
+    git clone https://github.com/alex33d/backtest_optimizer.git
+    cd backtest_optimizer
     ```
 
 3. **Create a Branch**
@@ -220,9 +222,14 @@ To maintain consistency in the codebase, please adhere to the following guidelin
 - Include docstrings for all functions and classes.
 - Write unit tests for new features and bug fixes.
 
-### Code of Conduct
+## License
 
-Please note that this project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior to [your.email@example.com](mailto:your.email@example.com).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-Thank you for contributing!
+## Contact
+
+For any questions, suggestions, or feedback, feel free to contact me:
+
+- **LinkedIn**: [Your LinkedIn Profile](https://www.linkedin.com/in/alexander-demachev-b067759b/) 
+
 
