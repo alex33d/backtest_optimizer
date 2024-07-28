@@ -1,3 +1,12 @@
+import sys
+import os
+
+# Get the directory of the current script
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add the current directory to the PYTHONPATH
+sys.path.append(current_dir)
+
 import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
@@ -17,7 +26,7 @@ import matplotlib
 import itertools as itt
 
 from metrics import *
-from backtest_optimizer.backtest_stress_tests import run_stress_tests
+from backtest_stress_tests import run_stress_tests
 
 matplotlib.use('TkAgg')
 
