@@ -28,7 +28,10 @@ import itertools as itt
 from metrics import *
 from backtest_stress_tests import run_stress_tests
 
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,  # Set to DEBUG for more detailed output
