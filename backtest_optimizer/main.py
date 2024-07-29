@@ -13,7 +13,7 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn.compose import make_column_selector
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
-
+import math
 
 import optuna
 from optuna.pruners import BasePruner
@@ -204,6 +204,8 @@ class ParameterOptimizer:
         final_returns = []
         group_dict = {}
         for ticker, df in self.train_data.items():
+            if ticker not in self.current_group:
+                continue
             df['ticker'] = ticker
             select_idx = self.current_group[ticker]['train']
             if self.current_group[ticker]['test'] and not is_train:
@@ -255,6 +257,7 @@ class ParameterOptimizer:
             n_splits (int): Number of total splits.
             n_test_splits (int): Number of test splits.
         """
+        total_comb = math.comb(n_splits, n_test_splits)
         if n_test_splits == 0 or n_splits == 0:
             logging.info('Using the entire dataset as the training set with no validation groups.')
             self.combcv_dict[0] = {}
@@ -264,8 +267,8 @@ class ParameterOptimizer:
             logging.info(
                 f'Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}')
             for ticker, df in self.train_data.items():
-                combination_num = 0
-                if not df.empty and df.index[0] + pd.Timedelta(weeks=52) < df.index[-1]:
+
+                if not df.empty and len(df) > total_comb * 50:
                     data_length = len(df)
                     is_test, paths, path_folds = self.cpcv_generator(data_length, n_splits, n_test_splits, verbose=False)
                     self.backtest_paths[ticker] = paths
