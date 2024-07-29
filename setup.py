@@ -4,7 +4,7 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
-    name="BacktestOptimizer",  
+    name="Backtest-Optimizer",  
     version="0.1.0",
     author="Alexnader Demachev",
     author_email="alexdemachev@gmail.com",
