@@ -22,7 +22,7 @@ setup(
     install_requires=[
         'numpy',
       'pandas',
-      'sklearn',
+      'scikit-learn',
       'optuna',
       'matplotlib',
       'scipy',
