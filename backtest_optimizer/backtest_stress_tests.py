@@ -14,7 +14,10 @@ from statsmodels.distributions.empirical_distribution import ECDF
 
 from metrics import *
 
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
