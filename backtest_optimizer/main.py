@@ -206,6 +206,7 @@ class ParameterOptimizer:
         for ticker, df in self.train_data.items():
             if ticker not in self.current_group:
                 continue
+            df = df.copy()
             df['ticker'] = ticker
             select_idx = self.current_group[ticker]['train']
             if self.current_group[ticker]['test'] and not is_train:
@@ -213,7 +214,7 @@ class ParameterOptimizer:
             for i, idx in enumerate(select_idx):
                 if i not in group_dict:
                     group_dict[i] = {}
-                new_df = df.iloc[idx].copy()
+                new_df = df.iloc[idx]
                 if not new_df.empty:
                     group_dict[i][ticker] = new_df
 
