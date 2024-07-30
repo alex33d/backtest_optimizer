@@ -190,18 +190,10 @@ class ParameterOptimizer:
 
         return (is_test, paths, path_folds)
 
-    def combcv_pl(self, params: dict, is_train: bool) -> tuple:
-        """
-        Calculate performance metrics using combinatorial cross-validation.
 
-        Args:
-            params (dict): Parameters for the performance calculation.
-            is_train (bool): Whether the data is for training or testing.
 
-        Returns:
-            tuple: (final_sharpe, final_returns) calculated metrics.
-        """
-        final_returns = []
+    def generate_group_dict(self, is_train: bool) -> dict:
+
         group_dict = {}
         for ticker, df in self.train_data.items():
             if ticker not in self.current_group:
@@ -217,6 +209,20 @@ class ParameterOptimizer:
                 if not new_df.empty:
                     group_dict[i][ticker] = new_df
 
+        return group_dict
+
+    def combcv_pl(self, params: dict, group_dict: dict) -> tuple:
+        """
+        Calculate performance metrics using combinatorial cross-validation.
+
+        Args:
+            params (dict): Parameters for the performance calculation.
+            is_train (bool): Whether the data is for training or testing.
+
+        Returns:
+            tuple: (final_sharpe, final_returns) calculated metrics.
+        """
+        final_returns = []
         for group_num, group_data in group_dict.items():
             returns = self.calc_pl(group_data, params)
             final_returns.append(returns)
@@ -298,11 +304,17 @@ class ParameterOptimizer:
         result = []
         self.params_dict = params.copy()
 
+        # Create the objective function closure
+        def objective_closure(trial):
+            return self.objective(trial, group_dict)
+
         for fold_num, train_test_splits in self.combcv_dict.items():
             logging.info(f'Starting optimization for group: {fold_num}')
             self.current_group = train_test_splits
+            group_dict = self.generate_group_dict(is_train=True)
+
             study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(multivariate=True))
-            study.optimize(self.objective, n_trials=n_runs, n_jobs=n_jobs)
+            study.optimize(objective_closure, n_trials=n_runs, n_jobs=n_jobs)
             top_trials = sorted([trial for trial in study.trials if
                                  trial.value is not None and trial.state == optuna.trial.TrialState.COMPLETE],
                                 key=lambda trial: trial.value, reverse=True)
@@ -315,8 +327,9 @@ class ParameterOptimizer:
             logging.info(f'Top {best_trials_pct} param combinations are: {top_params}')
             self.best_params_by_fold[fold_num] = top_params[0]
 
+            group_dict = self.generate_group_dict(is_train=False)
             for i, params in enumerate(top_params):
-                sharpe, returns_list = self.combcv_pl(params, is_train=False)
+                sharpe, returns_list = self.combcv_pl(params, group_dict)
                 params['sharpe'] = sharpe
                 result.append(params)
                 logging.info(f'Val perfomance: {params}')
@@ -410,12 +423,13 @@ class ParameterOptimizer:
         result = pd.concat(result, axis=1).dropna()
         run_stress_tests(result)
 
-    def objective(self, trial: optuna.Trial) -> float:
+    def objective(self, trial: optuna.Trial, group_dict) -> float:
         """
         Objective function for parameter optimization.
 
         Args:
             trial (optuna.Trial): The trial object.
+            group_dict (dict): The group dictionary.
 
         Returns:
             float: The Sharpe ratio.
@@ -438,7 +452,8 @@ class ParameterOptimizer:
         if current_params in existing_params:
             print(f"Pruning trial {trial.number} due to duplicate parameters: {params}")
             raise optuna.TrialPruned()
-        sharpe, _ = self.combcv_pl(params, is_train=True)
+
+        sharpe, _ = self.combcv_pl(params, group_dict)  # Pass group_dict to combcv_pl
         return sharpe
 
     def calculate_wcss(self, data: np.ndarray, max_clusters: int) -> list:
