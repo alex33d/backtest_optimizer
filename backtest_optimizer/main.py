@@ -207,7 +207,6 @@ class ParameterOptimizer:
             if ticker not in self.current_group:
                 continue
             df = df.copy()
-            df['ticker'] = ticker
             select_idx = self.current_group[ticker]['train']
             if self.current_group[ticker]['test'] and not is_train:
                 select_idx = self.current_group[ticker]['test']
