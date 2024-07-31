@@ -25,8 +25,8 @@ import logging
 import matplotlib
 import itertools as itt
 
-from metrics import *
-from backtest_stress_tests import run_stress_tests
+from backtest_optimizer.metrics import *
+from backtest_optimizer.backtest_stress_tests import run_stress_tests
 
 try:
     matplotlib.use('TkAgg')
