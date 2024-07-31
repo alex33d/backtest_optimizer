@@ -190,8 +190,6 @@ class ParameterOptimizer:
 
         return (is_test, paths, path_folds)
 
-
-
     def generate_group_dict(self, is_train: bool) -> dict:
 
         group_dict = {}
@@ -276,7 +274,8 @@ class ParameterOptimizer:
 
                 if not df.empty and len(df) > total_comb * 50:
                     data_length = len(df)
-                    is_test, paths, path_folds = self.cpcv_generator(data_length, n_splits, n_test_splits, verbose=False)
+                    is_test, paths, path_folds = self.cpcv_generator(data_length, n_splits, n_test_splits,
+                                                                     verbose=False)
                     self.backtest_paths[ticker] = paths
                     for combination_num in range(is_test.shape[1]):
                         if combination_num not in self.combcv_dict:
@@ -290,7 +289,8 @@ class ParameterOptimizer:
                             "test": [test_indices]
                         }
 
-    def optimize(self, params: dict, n_jobs: int, n_runs: int, best_trials_pct: float, save_file_name: str = None):
+    def optimize(self, params: dict, n_jobs: int, n_runs: int, best_trials_pct: float, save_path: str = None,
+                 file_prefix: str = None):
         """
         Optimize parameters using Optuna.
 
@@ -315,21 +315,25 @@ class ParameterOptimizer:
 
             study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(multivariate=True))
             study.optimize(objective_closure, n_trials=n_runs, n_jobs=n_jobs)
-            top_trials = sorted([trial for trial in study.trials if
+            all_trials = sorted([trial for trial in study.trials if
                                  trial.value is not None and trial.state == optuna.trial.TrialState.COMPLETE],
                                 key=lambda trial: trial.value, reverse=True)
-            top_trials = [trial.params for trial in top_trials]
-            for params in top_trials:
+            all_trials = [trial.params for trial in all_trials]
+            for params in all_trials:
                 for key, value in self.params_dict.items():
                     params.setdefault(key, value)
-            self.all_tested_params.extend(top_trials)
-            top_params = top_trials[:max(1, int(len(top_trials) * best_trials_pct))]
+            self.all_tested_params.extend(all_trials)
+            top_params = all_trials[:max(1, int(len(all_trials) * best_trials_pct))]
             logging.info(f'Top {best_trials_pct} param combinations are: {top_params}')
             self.best_params_by_fold[fold_num] = top_params[0]
 
             group_dict = self.generate_group_dict(is_train=False)
             for i, params in enumerate(top_params):
                 sharpe, returns_list = self.combcv_pl(params, group_dict)
+                if i == 0:
+                    params['fold_num'] = fold_num
+                else:
+                    params['fold_num'] = np.nan
                 params['sharpe'] = sharpe
                 result.append(params)
                 logging.info(f'Val perfomance: {params}')
@@ -338,9 +342,12 @@ class ParameterOptimizer:
         self.top_params_list = result
         self.all_tested_params = list({frozenset(d.items()): d for d in self.all_tested_params}.values())
 
-        if save_file_name is not None:
+        if save_path is not None:
             param_df = pd.DataFrame(self.top_params_list).sort_values('sharpe', ascending=False)
-            param_df.to_csv(save_file_name, index=False)
+            param_df.to_csv(save_path + file_prefix + 'top_params.csv', index=False)
+
+            all_tested_params_df = pd.DataFrame(self.all_tested_params)
+            all_tested_params_df.to_csv(save_path + file_prefix + 'all_tested_params.csv', index=False)
 
     def load_best_params(self, file_name: str = None, params: dict = None):
         """
@@ -513,6 +520,7 @@ class ParameterOptimizer:
             param_df = pd.DataFrame(self.top_params_list).drop(columns=['sharpe'])
         elif isinstance(self.top_params_list, pd.DataFrame):
             param_df = self.top_params_list.drop(columns=['sharpe'])
+            self.top_params_list = self.top_params_list.to_dict('records')
         else:
             raise Exception('Wrong data format for top params, accepted formats are list/DataFrame')
 
@@ -529,7 +537,8 @@ class ParameterOptimizer:
             )
 
             param_matrix_scaled = column_transformer.fit_transform(param_df)
-            best_n_clusters = self.find_optimal_clusters(param_matrix_scaled, max_clusters) if max_clusters < len(param_df) else max_clusters
+            best_n_clusters = self.find_optimal_clusters(param_matrix_scaled, max_clusters) if max_clusters < len(
+                param_df) else max_clusters
             logging.info(f'Optimal number of clusters: {best_n_clusters}')
             clustering = AgglomerativeClustering(n_clusters=best_n_clusters)
             cluster_labels = clustering.fit_predict(param_matrix_scaled)
@@ -538,7 +547,8 @@ class ParameterOptimizer:
             for param, cluster in zip(self.top_params_list, cluster_labels):
                 clustered_params[cluster].append(param)
 
-            best_cluster = max(clustered_params.keys(), key=lambda c: np.mean([p['sharpe'] for p in clustered_params[c]]))
+            best_cluster = max(clustered_params.keys(),
+                               key=lambda c: np.mean([p['sharpe'] for p in clustered_params[c]]))
             best_cluster_params = clustered_params[best_cluster]
             logging.info(f'Best cluster: {best_cluster_params}')
             best_param_set = self.aggregate_params(best_cluster_params)
@@ -590,4 +600,11 @@ class ParameterOptimizer:
                 aggregated[key] = max(set(values), key=values.count)
         return aggregated
 
+    def read_saved_params(self, save_path: str, file_prefix: str):
+        top_params_df = pd.read_csv(save_path + file_prefix + 'top_params.csv')
+        self.top_params_list = top_params_df.drop(columns=['fold_num'])
+        self.all_tested_params = pd.read_csv(save_path + file_prefix + 'all_tested_params.csv').to_dict('records')
 
+        top_params_list = top_params_df.dropna(subset='fold_num').to_dict('records')
+        for tp in top_params_list:
+            self.best_params_by_fold[tp['fold_num']] = tp
