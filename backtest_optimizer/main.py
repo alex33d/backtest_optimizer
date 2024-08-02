@@ -100,9 +100,10 @@ class ParameterOptimizer:
             if not train_df.empty:
                 self.train_data[ticker] = train_df
 
-            test_df = df.loc[train_end:].copy()
-            if not train_df.empty:
-                self.test_data[ticker] = test_df
+            if train_end in df.index:
+                test_df = df.loc[train_end:].copy()
+                if not train_df.empty:
+                    self.test_data[ticker] = test_df
 
     def align_dfs(self, dfs_dict: dict) -> dict:
         """
@@ -517,9 +518,9 @@ class ParameterOptimizer:
             dict: The aggregated best parameter set.
         """
         if isinstance(self.top_params_list, list):
-            param_df = pd.DataFrame(self.top_params_list).drop(columns=['sharpe'])
+            param_df = pd.DataFrame(self.top_params_list).drop(columns=['sharpe']).dropna(axis=1)
         elif isinstance(self.top_params_list, pd.DataFrame):
-            param_df = self.top_params_list.drop(columns=['sharpe'])
+            param_df = self.top_params_list.drop(columns=['sharpe']).dropna(axis=1)
             self.top_params_list = self.top_params_list.to_dict('records')
         else:
             raise Exception('Wrong data format for top params, accepted formats are list/DataFrame')
