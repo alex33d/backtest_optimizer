@@ -14,7 +14,7 @@ from sklearn.compose import make_column_selector
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 import math
-
+from tqdm import tqdm
 import optuna
 from optuna.pruners import BasePruner
 
@@ -104,6 +104,8 @@ class ParameterOptimizer:
                 test_df = df.loc[train_end:].copy()
                 if not train_df.empty:
                     self.test_data[ticker] = test_df
+
+        logging.info(f'Successfully splitted data')
 
     def align_dfs(self, dfs_dict: dict) -> dict:
         """
@@ -237,6 +239,9 @@ class ParameterOptimizer:
         Args:
             params (dict): Parameters for the performance calculation.
         """
+
+        logging.info('Plotting OOS resuts')
+
         returns = self.calc_pl(self.test_data, params)
         metrics = calculate_metrics(returns)
         text = ''
@@ -367,6 +372,9 @@ class ParameterOptimizer:
         """
         Reconstruct equity curves based on the best parameters.
         """
+
+        logging.info('Reconstructing val equity curves')
+
         arrays = list(self.backtest_paths.values())
         num_columns = arrays[0].shape[1]
         if not all(arr.shape[1] == num_columns for arr in arrays):
@@ -383,9 +391,11 @@ class ParameterOptimizer:
         final_metrics = []
         final_returns = []
         for path_num in range(n_paths):
+            logging.info(f'Starting for path {path_num}')
             path_returns = []
             unique_folds = np.unique(arrays[0][:, path_num])
             for fold in unique_folds:
+                logging.info(f'Starting for fold {fold}')
                 fold = int(fold)
                 params = self.best_params_by_fold[fold]
                 for ticker, path_array in self.backtest_paths.items():
@@ -422,8 +432,10 @@ class ParameterOptimizer:
         """
         Run stress tests on the best parameter sets.
         """
+
+        logging.info('Running stress tests')
         result = []
-        for params in self.all_tested_params:
+        for params in tqdm(self.all_tested_params, desc='Calculating individual returns'):
             returns = self.calc_pl(self.train_data, params)
             if not returns.empty:
                 returns = returns.resample('D').sum()
@@ -517,6 +529,9 @@ class ParameterOptimizer:
         Returns:
             dict: The aggregated best parameter set.
         """
+
+        logging.info('Starting clustering')
+
         if isinstance(self.top_params_list, list):
             param_df = pd.DataFrame(self.top_params_list).drop(columns=['sharpe']).dropna(axis=1)
         elif isinstance(self.top_params_list, pd.DataFrame):
@@ -602,6 +617,9 @@ class ParameterOptimizer:
         return aggregated
 
     def read_saved_params(self, save_path: str, file_prefix: str):
+
+        logging.info('Reading saved params')
+
         top_params_df = pd.read_csv(save_path + file_prefix + 'top_params.csv')
         self.top_params_list = top_params_df.drop(columns=['fold_num'])
         self.all_tested_params = pd.read_csv(save_path + file_prefix + 'all_tested_params.csv').to_dict('records')
@@ -609,3 +627,5 @@ class ParameterOptimizer:
         top_params_list = top_params_df.dropna(subset='fold_num').to_dict('records')
         for tp in top_params_list:
             self.best_params_by_fold[tp['fold_num']] = tp
+
+        logging.info('Params loaded')
