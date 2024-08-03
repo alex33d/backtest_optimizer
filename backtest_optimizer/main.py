@@ -17,6 +17,7 @@ import math
 from tqdm import tqdm
 import optuna
 from optuna.pruners import BasePruner
+from multiprocessing import Pool, Manager
 
 import matplotlib.pyplot as plt
 from itertools import combinations
@@ -41,6 +42,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+
 
 
 class RepeatPruner(BasePruner):
@@ -428,20 +431,41 @@ class ParameterOptimizer:
         ax.set_title('Cumulative Returns Over Time', fontsize=16)
         plt.show()
 
-    def run_stress_tests(self):
+    @staticmethod
+    def calc_returns(params, train_data, instance):
+        returns = instance.calc_pl(train_data, params)
+        if not returns.empty:
+            returns = returns.resample('D').sum()
+        return returns
+
+    @staticmethod
+    def calc_returns_helper(args):
+        params, train_data, instance = args
+        return instance.calc_returns(params, train_data, instance)
+
+    def run_stress_tests(self, num_workers=5):
         """
         Run stress tests on the best parameter sets.
         """
+        logging.info(f'Running stress tests, num_workers: {num_workers}')
 
-        logging.info('Running stress tests')
-        result = []
-        for params in tqdm(self.all_tested_params, desc='Calculating individual returns'):
-            returns = self.calc_pl(self.train_data, params)
-            if not returns.empty:
-                returns = returns.resample('D').sum()
-            result.append(returns)
-        result = pd.concat(result, axis=1).dropna()
-        run_stress_tests(result)
+        with Manager() as manager:
+            # Share train_data among processes
+            shared_train_data = manager.dict(self.train_data)
+
+            with Pool(processes=num_workers) as pool:
+                # Create arguments for the helper function
+                args = [(params, shared_train_data, self) for params in self.all_tested_params]
+                results = list(tqdm(pool.imap(self.calc_returns_helper, args),
+                                    total=len(self.all_tested_params),
+                                    desc='Calculating individual returns'))
+
+        # Filter out empty DataFrames
+        results = [r for r in results if not r.empty]
+
+        if results:
+            result_df = pd.concat(results, axis=1).dropna()
+            run_stress_tests(result_df)
 
     def objective(self, trial: optuna.Trial, group_dict) -> float:
         """
@@ -618,7 +642,7 @@ class ParameterOptimizer:
 
     def read_saved_params(self, save_path: str, file_prefix: str):
 
-        logging.info('Reading saved params')
+        logging.info('Loading saved params')
 
         top_params_df = pd.read_csv(save_path + file_prefix + 'top_params.csv')
         self.top_params_list = top_params_df.drop(columns=['fold_num'])
