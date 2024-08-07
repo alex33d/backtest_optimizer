@@ -17,7 +17,7 @@ import math
 from tqdm import tqdm
 import optuna
 from optuna.pruners import BasePruner
-from multiprocessing import Pool, Manager
+from multiprocessing import Pool, Manager, set_start_method, get_start_method
 
 import matplotlib.pyplot as plt
 from itertools import combinations
@@ -347,16 +347,16 @@ class ParameterOptimizer:
                 result.append(params)
                 logging.info(f'Val perfomance: {params}')
 
-        logging.info(f'Best params: {result}')
-        self.top_params_list = result
-        self.all_tested_params = list({frozenset(d.items()): d for d in self.all_tested_params}.values())
+            logging.info(f'Best params: {result}')
+            self.top_params_list = result
+            self.all_tested_params = list({frozenset(d.items()): d for d in self.all_tested_params}.values())
 
-        if save_path is not None:
-            param_df = pd.DataFrame(self.top_params_list).sort_values('sharpe', ascending=False)
-            param_df.to_csv(save_path + file_prefix + 'top_params.csv', index=False)
+            if save_path is not None:
+                param_df = pd.DataFrame(self.top_params_list).sort_values('sharpe', ascending=False)
+                param_df.to_csv(save_path + file_prefix + 'top_params.csv', index=False)
 
-            all_tested_params_df = pd.DataFrame(self.all_tested_params)
-            all_tested_params_df.to_csv(save_path + file_prefix + 'all_tested_params.csv', index=False)
+                all_tested_params_df = pd.DataFrame(self.all_tested_params)
+                all_tested_params_df.to_csv(save_path + file_prefix + 'all_tested_params.csv', index=False)
 
     def load_best_params(self, file_name: str = None, params: dict = None):
         """
@@ -393,7 +393,7 @@ class ParameterOptimizer:
         tmp_dict = {}
         final_metrics = []
         final_returns = []
-        for path_num in range(n_paths):
+        for path_num in tqdm(range(n_paths), desc = 'Path num'):
             logging.info(f'Starting for path {path_num}')
             path_returns = []
             unique_folds = np.unique(arrays[0][:, path_num])
@@ -431,17 +431,18 @@ class ParameterOptimizer:
         ax.set_title('Cumulative Returns Over Time', fontsize=16)
         plt.show()
 
-    @staticmethod
-    def calc_returns(params, train_data, instance):
-        returns = instance.calc_pl(train_data, params)
+
+    def calc_returns(self, args):
+        calc_pl_func, params, train_data = args
+        try:
+            returns = calc_pl_func(train_data, params)
+        except Exception as e:
+            logging.info(f'PL calculation for stress tests failed for {params}, with error {e}')
+            returns = pd.Series()
         if not returns.empty:
             returns = returns.resample('D').sum()
         return returns
 
-    @staticmethod
-    def calc_returns_helper(args):
-        params, train_data, instance = args
-        return instance.calc_returns(params, train_data, instance)
 
     def run_stress_tests(self, num_workers=5):
         """
@@ -449,16 +450,16 @@ class ParameterOptimizer:
         """
         logging.info(f'Running stress tests, num_workers: {num_workers}')
 
-        with Manager() as manager:
-            # Share train_data among processes
-            shared_train_data = manager.dict(self.train_data)
 
-            with Pool(processes=num_workers) as pool:
-                # Create arguments for the helper function
-                args = [(params, shared_train_data, self) for params in self.all_tested_params]
-                results = list(tqdm(pool.imap(self.calc_returns_helper, args),
-                                    total=len(self.all_tested_params),
-                                    desc='Calculating individual returns'))
+        # Share train_data among processes
+        shared_train_data = self.train_data.copy()
+
+        with Pool(processes=num_workers) as pool:
+            # Create arguments for the calc_returns function
+            args = [(self.calc_pl, params, shared_train_data) for params in self.all_tested_params]
+            results = list(tqdm(pool.imap(self.calc_returns, args),
+                                total=len(self.all_tested_params),
+                                desc='Calculating individual returns'))
 
         # Filter out empty DataFrames
         results = [r for r in results if not r.empty]
