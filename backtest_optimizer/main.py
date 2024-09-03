@@ -18,6 +18,7 @@ from tqdm import tqdm
 import optuna
 from optuna.pruners import BasePruner
 from multiprocessing import Pool, Manager, set_start_method, get_start_method
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 from itertools import combinations
@@ -28,22 +29,6 @@ import itertools as itt
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
-
-try:
-    matplotlib.use('TkAgg')
-except:
-    pass
-
-logging.basicConfig(
-    level=logging.INFO,  # Set to DEBUG for more detailed output
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("optimization.log", mode='w'),
-        logging.StreamHandler()
-    ]
-)
-
-
 
 
 class RepeatPruner(BasePruner):
@@ -86,6 +71,95 @@ class ParameterOptimizer:
         self.train_data = {}
         self.test_data = {}
 
+    def check_datetime_index_integrity(self, data_dict: Dict[str, pd.DataFrame]) -> Tuple[bool, List[str]]:
+        """
+        Check the integrity of datetime indices in a dictionary of DataFrames.
+
+        Args:
+        data_dict (Dict[str, pd.DataFrame]): Dictionary of DataFrames with datetime indices.
+
+        Returns:
+        Tuple[bool, List[str]]: A tuple containing:
+            - Boolean indicating overall integrity (True if all checks pass)
+            - List of error messages (empty if all checks pass)
+        """
+        error_messages = []
+
+        # Check if dictionary is empty
+        if not data_dict:
+            error_messages.append("The input dictionary is empty.")
+            return False, error_messages
+
+        # Collect all unique dates across all DataFrames
+        all_dates = set()
+        for ticker, df in data_dict.items():
+            # Check if index is DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                error_messages.append(f"DataFrame for {ticker} does not have a DatetimeIndex.")
+                continue
+
+            all_dates.update(df.index)
+
+        all_dates = sorted(all_dates)
+
+        for ticker, df in data_dict.items():
+            # Check for duplicate indices
+            if df.index.duplicated().any():
+                error_messages.append(f"DataFrame for {ticker} contains duplicate timestamps.")
+
+            # Check if index is sorted
+            if not df.index.is_monotonic_increasing:
+                error_messages.append(f"Index for {ticker} is not monotonically increasing.")
+
+            # Check for missing dates
+            missing_dates = set(all_dates) - set(df.index)
+            if missing_dates:
+                error_messages.append(f"DataFrame for {ticker} is missing {len(missing_dates)} dates.")
+
+            # Check for gaps in the index
+            if len(df) > 1:
+                freq = pd.infer_freq(df.index)
+                if freq is not None:
+                    ideal_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+                    gaps = ideal_index.difference(df.index)
+                    if len(gaps) > 0:
+                        error_messages.append(f"DataFrame for {ticker} has {len(gaps)} gaps in its index.")
+                else:
+                    error_messages.append(f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps.")
+
+            # Check for future dates
+            if df.index.max() > pd.Timestamp.now():
+                error_messages.append(f"DataFrame for {ticker} contains future dates.")
+
+            # Check for very old dates (e.g., before year 2000)
+            if df.index.min() < pd.Timestamp('2000-01-01'):
+                error_messages.append(f"DataFrame for {ticker} contains very old dates (before year 2000).")
+
+        return len(error_messages) == 0, error_messages
+
+    def align_dataframes_to_max_index(self, data_dict: dict):
+        # Find the maximum date range
+        all_dates = pd.DatetimeIndex([])
+        for df in data_dict.values():
+            all_dates = all_dates.union(df.index)
+
+        # Sort the dates to ensure they're in chronological order
+        all_dates = all_dates.sort_values()
+
+        # Create a new dictionary to store the aligned DataFrames
+        aligned_data_dict = {}
+
+        for ticker, df in data_dict.items():
+            # Reindex the DataFrame to the full date range
+            aligned_df = df.reindex(all_dates)
+
+            # If you want to forward fill a limited number of NaNs (e.g., 5 days), uncomment the next line
+            # aligned_df = aligned_df.fillna(method='ffill', limit=5)
+
+            aligned_data_dict[ticker] = aligned_df
+
+        return aligned_data_dict
+
     def split_data(self, data_dict: dict, train_end: str):
         """
         Split data into training and testing sets based on the specified date.
@@ -95,17 +169,23 @@ class ParameterOptimizer:
             train_end (str): The end date for the training data.
         """
         logging.info(f'Splitting data to train-test, cutoff: {train_end}')
+
+        data_dict = self.align_dataframes_to_max_index(data_dict)
+
         self.train_data = {}
         self.test_data = {}
 
         for ticker, df in data_dict.items():
+
             train_df = df.loc[:train_end].copy()
             if not train_df.empty:
                 self.train_data[ticker] = train_df
+            else:
+                continue
 
             if train_end in df.index:
                 test_df = df.loc[train_end:].copy()
-                if not train_df.empty:
+                if not test_df.empty:
                     self.test_data[ticker] = test_df
 
         logging.info(f'Successfully splitted data')
@@ -213,6 +293,14 @@ class ParameterOptimizer:
                 if not new_df.empty:
                     group_dict[i][ticker] = new_df
 
+
+        logging.info('Checking datetime integrity for tickers')
+        for i, data_dict in group_dict.items():
+            integrity_check, messages = self.check_datetime_index_integrity(data_dict)
+            if not integrity_check:
+                for message in messages:
+                    print(message)
+
         return group_dict
 
     def combcv_pl(self, params: dict, group_dict: dict) -> tuple:
@@ -228,6 +316,7 @@ class ParameterOptimizer:
         """
         final_returns = []
         for group_num, group_data in group_dict.items():
+            group_data = group_data.copy()
             returns = self.calc_pl(group_data, params)
             final_returns.append(returns)
 
@@ -270,6 +359,22 @@ class ParameterOptimizer:
             n_splits (int): Number of total splits.
             n_test_splits (int): Number of test splits.
         """
+
+        def split_consecutive(arr):
+            # Ensure the input is a NumPy array
+            arr = np.asarray(arr)
+
+            # Calculate the differences between adjacent elements
+            diff = np.diff(arr)
+
+            # Find where the difference is not 1 (i.e., where sequences break)
+            split_points = np.where(diff != 1)[0] + 1
+
+            # Use these split points to create chunks
+            chunks = np.split(arr, split_points)
+
+            return chunks
+
         total_comb = math.comb(n_splits, n_test_splits)
         if n_test_splits == 0 or n_splits == 0:
             logging.info('Using the entire dataset as the training set with no validation groups.')
@@ -281,7 +386,7 @@ class ParameterOptimizer:
                 f'Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}')
             for ticker, df in self.train_data.items():
 
-                if not df.empty and len(df) > total_comb * 50:
+                if len(df) > total_comb * 50:
                     data_length = len(df)
                     is_test, paths, path_folds = self.cpcv_generator(data_length, n_splits, n_test_splits,
                                                                      verbose=False)
@@ -293,9 +398,13 @@ class ParameterOptimizer:
                         train_indices = np.where(~is_test[:, combination_num])[0]
                         test_indices = np.where(is_test[:, combination_num])[0]
 
+                        train_indices = split_consecutive(train_indices)
+                        test_indices = split_consecutive(test_indices)
+
+
                         self.combcv_dict[combination_num][ticker] = {
-                            "train": [train_indices],
-                            "test": [test_indices]
+                            "train": train_indices,
+                            "test": test_indices
                         }
 
     def optimize(self, params: dict, n_jobs: int, n_runs: int, best_trials_pct: float, save_path: str = None,
@@ -357,6 +466,7 @@ class ParameterOptimizer:
 
                 all_tested_params_df = pd.DataFrame(self.all_tested_params)
                 all_tested_params_df.to_csv(save_path + file_prefix + 'all_tested_params.csv', index=False)
+                logging.info(f'Interim optimization results saved to {save_path}')
 
     def load_best_params(self, file_name: str = None, params: dict = None):
         """
