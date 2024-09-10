@@ -23,6 +23,7 @@ from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 from itertools import combinations
 from collections.abc import Iterable
+from functools import partial
 import logging
 import matplotlib
 import itertools as itt
@@ -47,9 +48,36 @@ class RepeatPruner(BasePruner):
         trials = study.get_trials(deepcopy=False)
         params_list = [t.params for t in trials]
         if params_list.count(trial.params) > 1:
-            print(f"Trial {trial.number} pruned due to duplicate parameters: {trial.params}")
+            print(
+                f"Trial {trial.number} pruned due to duplicate parameters: {trial.params}"
+            )
             return True
         return False
+
+
+def standalone_combcv_pl(calc_pl, params: dict, group_dict: dict) -> tuple:
+    """
+    Calculate performance metrics using combinatorial cross-validation.
+
+    Args:
+        calc_pl (callable): Function to calculate performance.
+        params (dict): Parameters for the performance calculation.
+        group_dict (dict): Dictionary of group data.
+
+    Returns:
+        tuple: (final_sharpe, final_returns) calculated metrics.
+    """
+    final_returns = []
+    for group_num, group_data in group_dict.items():
+        group_data = group_data.copy()
+        returns = calc_pl(group_data, params)
+        final_returns.append(returns)
+
+    sharpe_ratios = [
+        annual_sharpe(returns) for returns in final_returns if not returns.empty
+    ]
+    final_sharpe = np.nanmean(sharpe_ratios)
+    return final_sharpe, final_returns
 
 
 class ParameterOptimizer:
@@ -71,7 +99,9 @@ class ParameterOptimizer:
         self.train_data = {}
         self.test_data = {}
 
-    def check_datetime_index_integrity(self, data_dict: Dict[str, pd.DataFrame]) -> Tuple[bool, List[str]]:
+    def check_datetime_index_integrity(
+        self, data_dict: Dict[str, pd.DataFrame]
+    ) -> Tuple[bool, List[str]]:
         """
         Check the integrity of datetime indices in a dictionary of DataFrames.
 
@@ -95,7 +125,9 @@ class ParameterOptimizer:
         for ticker, df in data_dict.items():
             # Check if index is DatetimeIndex
             if not isinstance(df.index, pd.DatetimeIndex):
-                error_messages.append(f"DataFrame for {ticker} does not have a DatetimeIndex.")
+                error_messages.append(
+                    f"DataFrame for {ticker} does not have a DatetimeIndex."
+                )
                 continue
 
             all_dates.update(df.index)
@@ -105,35 +137,49 @@ class ParameterOptimizer:
         for ticker, df in data_dict.items():
             # Check for duplicate indices
             if df.index.duplicated().any():
-                error_messages.append(f"DataFrame for {ticker} contains duplicate timestamps.")
+                error_messages.append(
+                    f"DataFrame for {ticker} contains duplicate timestamps."
+                )
 
             # Check if index is sorted
             if not df.index.is_monotonic_increasing:
-                error_messages.append(f"Index for {ticker} is not monotonically increasing.")
+                error_messages.append(
+                    f"Index for {ticker} is not monotonically increasing."
+                )
 
             # Check for missing dates
             missing_dates = set(all_dates) - set(df.index)
             if missing_dates:
-                error_messages.append(f"DataFrame for {ticker} is missing {len(missing_dates)} dates.")
+                error_messages.append(
+                    f"DataFrame for {ticker} is missing {len(missing_dates)} dates."
+                )
 
             # Check for gaps in the index
             if len(df) > 1:
                 freq = pd.infer_freq(df.index)
                 if freq is not None:
-                    ideal_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+                    ideal_index = pd.date_range(
+                        start=df.index.min(), end=df.index.max(), freq=freq
+                    )
                     gaps = ideal_index.difference(df.index)
                     if len(gaps) > 0:
-                        error_messages.append(f"DataFrame for {ticker} has {len(gaps)} gaps in its index.")
+                        error_messages.append(
+                            f"DataFrame for {ticker} has {len(gaps)} gaps in its index."
+                        )
                 else:
-                    error_messages.append(f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps.")
+                    error_messages.append(
+                        f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps."
+                    )
 
             # Check for future dates
             if df.index.max() > pd.Timestamp.now():
                 error_messages.append(f"DataFrame for {ticker} contains future dates.")
 
             # Check for very old dates (e.g., before year 2000)
-            if df.index.min() < pd.Timestamp('2000-01-01'):
-                error_messages.append(f"DataFrame for {ticker} contains very old dates (before year 2000).")
+            if df.index.min() < pd.Timestamp("2000-01-01"):
+                error_messages.append(
+                    f"DataFrame for {ticker} contains very old dates (before year 2000)."
+                )
 
         return len(error_messages) == 0, error_messages
 
@@ -168,14 +214,16 @@ class ParameterOptimizer:
             data_dict (dict): Dictionary containing the data.
             train_end (str): The end date for the training data.
         """
-        logging.info(f'Splitting data to train-test, cutoff: {train_end}')
+        logging.info(f"Splitting data to train-test, cutoff: {train_end}")
 
         data_dict = self.align_dataframes_to_max_index(data_dict)
 
-        self.train_data = {}
-        self.test_data = {}
-
         for ticker, df in data_dict.items():
+
+            for col in df.select_dtypes(include=[np.float64]).columns:
+                df[col] = df[col].astype(np.float32)
+            for col in df.select_dtypes(include=[np.int64]).columns:
+                df[col] = df[col].astype(np.int32)
 
             train_df = df.loc[:train_end].copy()
             if not train_df.empty:
@@ -188,39 +236,11 @@ class ParameterOptimizer:
                 if not test_df.empty:
                     self.test_data[ticker] = test_df
 
-        logging.info(f'Successfully splitted data')
+        logging.info(f"Successfully splitted data")
 
-    def align_dfs(self, dfs_dict: dict) -> dict:
-        """
-        Align DataFrames by reindexing them to a common date range.
-
-        Args:
-            dfs_dict (dict): Dictionary of DataFrames.
-
-        Returns:
-            dict: Dictionary of aligned DataFrames.
-        """
-        # Find the minimum and maximum datetime index across all DataFrames
-        min_index = min(df.index.min() for df in dfs_dict.values())
-        max_index = max(df.index.max() for df in dfs_dict.values())
-
-        # Determine the frequency from the DataFrames
-        inferred_freqs = [pd.infer_freq(df.index) for df in dfs_dict.values() if pd.infer_freq(df.index) is not None]
-        if not inferred_freqs:
-            raise ValueError("No valid frequency could be inferred from the DataFrames' indices.")
-
-        # Use the most common frequency
-        freq = max(set(inferred_freqs), key=inferred_freqs.count)
-
-        # Create a new date range from the minimum to the maximum datetime index with the inferred frequency
-        new_index = pd.date_range(start=min_index, end=max_index, freq=freq)
-
-        # Reindex each DataFrame to the new date range, filling missing rows with NaN
-        aligned_dfs_dict = {ticker: df.reindex(new_index) for ticker, df in dfs_dict.items()}
-
-        return aligned_dfs_dict
-
-    def cpcv_generator(self, t_span: int, n: int, k: int, verbose: bool = True) -> tuple:
+    def cpcv_generator(
+        self, t_span: int, n: int, k: int, verbose: bool = True
+    ) -> tuple:
         """
         Generate combinatorial purged cross-validation (CPCV) splits.
 
@@ -241,8 +261,8 @@ class ParameterOptimizer:
         n_paths = C_nk * k // n
 
         if verbose:
-            print('n_sim:', C_nk)
-            print('n_paths:', n_paths)
+            print("n_sim:", C_nk)
+            print("n_paths:", n_paths)
 
         is_test_group = np.full((n, C_nk), fill_value=False)
         is_test = np.full((t_span, C_nk), fill_value=False)
@@ -251,12 +271,12 @@ class ParameterOptimizer:
             for k, pair in enumerate(test_groups):
                 for i in pair:
                     is_test_group[i, k] = True
-                    mask = (group_num == i)
+                    mask = group_num == i
                     is_test[mask, k] = True
         else:
             for k, i in enumerate(test_groups.flatten()):
                 is_test_group[i, k] = True
-                mask = (group_num == i)
+                mask = group_num == i
                 is_test[mask, k] = True
 
         path_folds = np.full((n, n_paths), fill_value=np.nan)
@@ -271,7 +291,7 @@ class ParameterOptimizer:
 
         for p in range(n_paths):
             for i in range(n):
-                mask = (group_num == i)
+                mask = group_num == i
                 paths[mask, p] = int(path_folds[i, p])
 
         return (is_test, paths, path_folds)
@@ -283,9 +303,9 @@ class ParameterOptimizer:
             if ticker not in self.current_group:
                 continue
             df = df.copy()
-            select_idx = self.current_group[ticker]['train']
-            if self.current_group[ticker]['test'] and not is_train:
-                select_idx = self.current_group[ticker]['test']
+            select_idx = self.current_group[ticker]["train"]
+            if self.current_group[ticker]["test"] and not is_train:
+                select_idx = self.current_group[ticker]["test"]
             for i, idx in enumerate(select_idx):
                 if i not in group_dict:
                     group_dict[i] = {}
@@ -293,8 +313,7 @@ class ParameterOptimizer:
                 if not new_df.empty:
                     group_dict[i][ticker] = new_df
 
-
-        logging.info('Checking datetime integrity for tickers')
+        logging.info("Checking datetime integrity for tickers")
         for i, data_dict in group_dict.items():
             integrity_check, messages = self.check_datetime_index_integrity(data_dict)
             if not integrity_check:
@@ -320,35 +339,45 @@ class ParameterOptimizer:
             returns = self.calc_pl(group_data, params)
             final_returns.append(returns)
 
-        sharpe_ratios = [annual_sharpe(returns) for returns in final_returns if not returns.empty]
+        sharpe_ratios = [
+            annual_sharpe(returns) for returns in final_returns if not returns.empty
+        ]
         final_sharpe = np.nanmean(sharpe_ratios)
         return final_sharpe, final_returns
 
-    def calc_oos_sharpe(self, params: dict):
+    def plot_returns(self, data_dict, params: dict):
         """
         Calculate out-of-sample Sharpe ratio and plot cumulative returns.
 
         Args:
+            data_dict: dictionary with data in format {'ticker':DF,...}
             params (dict): Parameters for the performance calculation.
         """
 
-        logging.info('Plotting OOS resuts')
+        logging.info("Plotting OOS resuts")
 
-        returns = self.calc_pl(self.test_data, params)
+        returns = self.calc_pl(data_dict, params)
         metrics = calculate_metrics(returns)
-        text = ''
+        text = ""
         for metric, v in metrics.items():
-            text += f'{metric}: {round(v, 2)}\n'
+            text += f"{metric}: {round(v, 2)}\n"
 
         fig, ax = plt.subplots(figsize=(12, 8))
         ax.plot(returns.cumsum())
-        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-        ax.text(0.05, 0.95, text, transform=ax.transAxes, fontsize=12,
-                verticalalignment='top', bbox=props)
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        ax.set_xlabel('Date', fontsize=14)
-        ax.set_ylabel('Cumulative Returns', fontsize=14)
-        ax.set_title('Cumulative Returns Over Time', fontsize=16)
+        props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+        ax.text(
+            0.05,
+            0.95,
+            text,
+            transform=ax.transAxes,
+            fontsize=12,
+            verticalalignment="top",
+            bbox=props,
+        )
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.set_xlabel("Date", fontsize=14)
+        ax.set_ylabel("Cumulative Returns", fontsize=14)
+        ax.set_title("Cumulative Returns Over Time", fontsize=16)
         plt.show()
 
     def create_combcv_dict(self, n_splits: int, n_test_splits: int):
@@ -377,19 +406,26 @@ class ParameterOptimizer:
 
         total_comb = math.comb(n_splits, n_test_splits)
         if n_test_splits == 0 or n_splits == 0:
-            logging.info('Using the entire dataset as the training set with no validation groups.')
+            logging.info(
+                "Using the entire dataset as the training set with no validation groups."
+            )
             self.combcv_dict[0] = {}
             for ticker, df in self.train_data.items():
-                self.combcv_dict[0][ticker] = {"train": [np.arange(len(df))], "test": None}
+                self.combcv_dict[0][ticker] = {
+                    "train": [np.arange(len(df))],
+                    "test": None,
+                }
         else:
             logging.info(
-                f'Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}')
+                f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
+            )
             for ticker, df in self.train_data.items():
 
                 if len(df) > total_comb * 50:
                     data_length = len(df)
-                    is_test, paths, path_folds = self.cpcv_generator(data_length, n_splits, n_test_splits,
-                                                                     verbose=False)
+                    is_test, paths, path_folds = self.cpcv_generator(
+                        data_length, n_splits, n_test_splits, verbose=False
+                    )
                     self.backtest_paths[ticker] = paths
                     for combination_num in range(is_test.shape[1]):
                         if combination_num not in self.combcv_dict:
@@ -401,14 +437,20 @@ class ParameterOptimizer:
                         train_indices = split_consecutive(train_indices)
                         test_indices = split_consecutive(test_indices)
 
-
                         self.combcv_dict[combination_num][ticker] = {
                             "train": train_indices,
-                            "test": test_indices
+                            "test": test_indices,
                         }
 
-    def optimize(self, params: dict, n_jobs: int, n_runs: int, best_trials_pct: float, save_path: str = None,
-                 file_prefix: str = None):
+    def optimize(
+        self,
+        params: dict,
+        n_jobs: int,
+        n_runs: int,
+        best_trials_pct: float,
+        save_path: str = None,
+        file_prefix: str = None,
+    ):
         """
         Optimize parameters using Optuna.
 
@@ -420,53 +462,103 @@ class ParameterOptimizer:
             save_file_name (str, optional): File name to save the results.
         """
         result = []
-        self.params_dict = params.copy()
+        params_dict = params.copy()
+        all_tested_params = []
+        combcv_pl = partial(standalone_combcv_pl, self.calc_pl)
+
+        def objective(trial: optuna.Trial, group_dict: dict) -> float:
+            trial_params = {}
+            for k, v in params_dict.items():
+                if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+                    trial_params[k] = v
+                elif all(isinstance(item, int) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                elif any(isinstance(item, float) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                else:
+                    trial_params[k] = trial.suggest_categorical(k, v)
+
+            current_params = trial.params
+            existing_trials = trial.study.get_trials(deepcopy=False)
+            completed_trials = [
+                t
+                for t in existing_trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ]
+            existing_params = [t.params for t in completed_trials]
+            if current_params in existing_params:
+                logging.info(
+                    f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
+                )
+                raise optuna.TrialPruned()
+
+            sharpe, _ = combcv_pl(trial_params, group_dict)
+            return sharpe
 
         # Create the objective function closure
-        def objective_closure(trial):
-            return self.objective(trial, group_dict)
-
         for fold_num, train_test_splits in self.combcv_dict.items():
-            logging.info(f'Starting optimization for group: {fold_num}')
+            logging.info(f"Starting optimization for group: {fold_num}")
             self.current_group = train_test_splits
-            group_dict = self.generate_group_dict(is_train=True)
+            train_group_dict = self.generate_group_dict(is_train=True)
 
-            study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(multivariate=True))
-            study.optimize(objective_closure, n_trials=n_runs, n_jobs=n_jobs)
-            all_trials = sorted([trial for trial in study.trials if
-                                 trial.value is not None and trial.state == optuna.trial.TrialState.COMPLETE],
-                                key=lambda trial: trial.value, reverse=True)
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(multivariate=True),
+            )
+            study.optimize(
+                lambda trial: objective(trial, train_group_dict),
+                n_trials=n_runs,
+                n_jobs=n_jobs,
+            )
+
+            all_trials = sorted(
+                [
+                    trial
+                    for trial in study.trials
+                    if trial.value is not None
+                    and trial.state == optuna.trial.TrialState.COMPLETE
+                ],
+                key=lambda trial: trial.value,
+                reverse=True,
+            )
             all_trials = [trial.params for trial in all_trials]
-            for params in all_trials:
-                for key, value in self.params_dict.items():
-                    params.setdefault(key, value)
-            self.all_tested_params.extend(all_trials)
-            top_params = all_trials[:max(1, int(len(all_trials) * best_trials_pct))]
-            logging.info(f'Top {best_trials_pct} param combinations are: {top_params}')
+            for trial_params in all_trials:
+                for key, value in params_dict.items():
+                    trial_params.setdefault(key, value)
+            all_tested_params.extend(all_trials)
+            top_params = all_trials[: max(1, int(len(all_trials) * best_trials_pct))]
+            logging.info(f"Top {best_trials_pct} param combinations are: {top_params}")
+
+            test_group_dict = self.generate_group_dict(is_train=False)
+            for i, trial_params in enumerate(top_params):
+                sharpe, returns_list = combcv_pl(trial_params, test_group_dict)
+                if i == 0:
+                    trial_params["fold_num"] = fold_num
+                else:
+                    trial_params["fold_num"] = np.nan
+                trial_params["sharpe"] = sharpe
+                result.append(trial_params)
+                logging.info(f"Val performance: {trial_params}")
+
+            logging.info(f"Best params: {result}")
+
+            self.top_params_list = result
+            self.all_tested_params = list(
+                {frozenset(d.items()): d for d in all_tested_params}.values()
+            )
             self.best_params_by_fold[fold_num] = top_params[0]
 
-            group_dict = self.generate_group_dict(is_train=False)
-            for i, params in enumerate(top_params):
-                sharpe, returns_list = self.combcv_pl(params, group_dict)
-                if i == 0:
-                    params['fold_num'] = fold_num
-                else:
-                    params['fold_num'] = np.nan
-                params['sharpe'] = sharpe
-                result.append(params)
-                logging.info(f'Val perfomance: {params}')
-
-            logging.info(f'Best params: {result}')
-            self.top_params_list = result
-            self.all_tested_params = list({frozenset(d.items()): d for d in self.all_tested_params}.values())
-
             if save_path is not None:
-                param_df = pd.DataFrame(self.top_params_list).sort_values('sharpe', ascending=False)
-                param_df.to_csv(save_path + file_prefix + 'top_params.csv', index=False)
+                param_df = pd.DataFrame(self.top_params_list).sort_values(
+                    "sharpe", ascending=False
+                )
+                param_df.to_csv(save_path + file_prefix + "top_params.csv", index=False)
 
                 all_tested_params_df = pd.DataFrame(self.all_tested_params)
-                all_tested_params_df.to_csv(save_path + file_prefix + 'all_tested_params.csv', index=False)
-                logging.info(f'Interim optimization results saved to {save_path}')
+                all_tested_params_df.to_csv(
+                    save_path + file_prefix + "all_tested_params.csv", index=False
+                )
+                logging.info(f"Interim optimization results saved to {save_path}")
 
     def load_best_params(self, file_name: str = None, params: dict = None):
         """
@@ -486,29 +578,31 @@ class ParameterOptimizer:
         Reconstruct equity curves based on the best parameters.
         """
 
-        logging.info('Reconstructing val equity curves')
+        logging.info("Reconstructing val equity curves")
 
         arrays = list(self.backtest_paths.values())
         num_columns = arrays[0].shape[1]
         if not all(arr.shape[1] == num_columns for arr in arrays):
-            raise Exception('Tickers have different number of backtest paths')
+            raise Exception("Tickers have different number of backtest paths")
 
         for col in range(num_columns):
             unique_values_set = set(np.unique(arrays[0][:, col]))
             for arr in arrays[1:]:
                 if unique_values_set != set(np.unique(arr[:, col])):
-                    raise Exception('Tickers have different parameter folds within same backtest path number')
+                    raise Exception(
+                        "Tickers have different parameter folds within same backtest path number"
+                    )
 
         n_paths = num_columns
         tmp_dict = {}
         final_metrics = []
         final_returns = []
-        for path_num in tqdm(range(n_paths), desc = 'Path num'):
-            logging.info(f'Starting for path {path_num}')
+        for path_num in tqdm(range(n_paths), desc="Path num"):
+            logging.info(f"Starting for path {path_num}")
             path_returns = []
             unique_folds = np.unique(arrays[0][:, path_num])
             for fold in unique_folds:
-                logging.info(f'Starting for fold {fold}')
+                logging.info(f"Starting for fold {fold}")
                 fold = int(fold)
                 params = self.best_params_by_fold[fold]
                 for ticker, path_array in self.backtest_paths.items():
@@ -524,52 +618,65 @@ class ParameterOptimizer:
 
         final_metrics = pd.DataFrame(final_metrics).mean().to_dict()
 
-        text = ''
+        text = ""
         for metric, v in final_metrics.items():
-            text += f'Mean {metric}: {round(v, 2)}\n'
+            text += f"Mean {metric}: {round(v, 2)}\n"
 
         fig, ax = plt.subplots(figsize=(12, 8))
         for returns in final_returns:
-            ax.plot(returns.resample('D').sum().cumsum())
+            ax.plot(returns.resample("D").sum().cumsum())
 
-        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-        ax.text(0.05, 0.95, text, transform=ax.transAxes, fontsize=12,
-                verticalalignment='top', bbox=props)
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        ax.set_xlabel('Date', fontsize=14)
-        ax.set_ylabel('Cumulative Returns', fontsize=14)
-        ax.set_title('Cumulative Returns Over Time', fontsize=16)
+        props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+        ax.text(
+            0.05,
+            0.95,
+            text,
+            transform=ax.transAxes,
+            fontsize=12,
+            verticalalignment="top",
+            bbox=props,
+        )
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.set_xlabel("Date", fontsize=14)
+        ax.set_ylabel("Cumulative Returns", fontsize=14)
+        ax.set_title("Cumulative Returns Over Time", fontsize=16)
         plt.show()
-
 
     def calc_returns(self, args):
         calc_pl_func, params, train_data = args
         try:
             returns = calc_pl_func(train_data, params)
         except Exception as e:
-            logging.info(f'PL calculation for stress tests failed for {params}, with error {e}')
+            logging.info(
+                f"PL calculation for stress tests failed for {params}, with error {e}"
+            )
             returns = pd.Series()
         if not returns.empty:
-            returns = returns.resample('D').sum()
+            returns = returns.resample("D").sum()
         return returns
-
 
     def run_stress_tests(self, num_workers=5):
         """
         Run stress tests on the best parameter sets.
         """
-        logging.info(f'Running stress tests, num_workers: {num_workers}')
-
+        logging.info(f"Running stress tests, num_workers: {num_workers}")
 
         # Share train_data among processes
         shared_train_data = self.train_data.copy()
 
         with Pool(processes=num_workers) as pool:
             # Create arguments for the calc_returns function
-            args = [(self.calc_pl, params, shared_train_data) for params in self.all_tested_params]
-            results = list(tqdm(pool.imap(self.calc_returns, args),
-                                total=len(self.all_tested_params),
-                                desc='Calculating individual returns'))
+            args = [
+                (self.calc_pl, params, shared_train_data)
+                for params in self.all_tested_params
+            ]
+            results = list(
+                tqdm(
+                    pool.imap(self.calc_returns, args),
+                    total=len(self.all_tested_params),
+                    desc="Calculating individual returns",
+                )
+            )
 
         # Filter out empty DataFrames
         results = [r for r in results if not r.empty]
@@ -578,38 +685,42 @@ class ParameterOptimizer:
             result_df = pd.concat(results, axis=1).dropna()
             run_stress_tests(result_df)
 
-    def objective(self, trial: optuna.Trial, group_dict) -> float:
-        """
-        Objective function for parameter optimization.
-
-        Args:
-            trial (optuna.Trial): The trial object.
-            group_dict (dict): The group dictionary.
-
-        Returns:
-            float: The Sharpe ratio.
-        """
-        params = {}
-        for k, v in self.params_dict.items():
-            if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
-                params[k] = v
-            elif all(isinstance(item, int) for item in v):
-                params[k] = int(trial.suggest_categorical(k, v))
-            elif any(isinstance(item, float) for item in v):
-                params[k] = float(trial.suggest_categorical(k, v))
-            elif any(isinstance(item, str) for item in v) or any(isinstance(item, list) for item in v):
-                params[k] = (trial.suggest_categorical(k, v))
-
-        current_params = trial.params
-        existing_trials = trial.study.get_trials(deepcopy=False)
-        completed_trials = [t for t in existing_trials if t.state == optuna.trial.TrialState.COMPLETE]
-        existing_params = [t.params for t in completed_trials]
-        if current_params in existing_params:
-            print(f"Pruning trial {trial.number} due to duplicate parameters: {params}")
-            raise optuna.TrialPruned()
-
-        sharpe, _ = self.combcv_pl(params, group_dict)  # Pass group_dict to combcv_pl
-        return sharpe
+    # def objective(self, trial: optuna.Trial, group_dict) -> float:
+    #     """
+    #     Objective function for parameter optimization.
+    #
+    #     Args:
+    #         trial (optuna.Trial): The trial object.
+    #         group_dict (dict): The group dictionary.
+    #
+    #     Returns:
+    #         float: The Sharpe ratio.
+    #     """
+    #     params = {}
+    #     for k, v in self.params_dict.items():
+    #         if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+    #             params[k] = v
+    #         elif all(isinstance(item, int) for item in v):
+    #             params[k] = int(trial.suggest_categorical(k, v))
+    #         elif any(isinstance(item, float) for item in v):
+    #             params[k] = float(trial.suggest_categorical(k, v))
+    #         elif any(isinstance(item, str) for item in v) or any(
+    #             isinstance(item, list) for item in v
+    #         ):
+    #             params[k] = trial.suggest_categorical(k, v)
+    #
+    #     current_params = trial.params
+    #     existing_trials = trial.study.get_trials(deepcopy=False)
+    #     completed_trials = [
+    #         t for t in existing_trials if t.state == optuna.trial.TrialState.COMPLETE
+    #     ]
+    #     existing_params = [t.params for t in completed_trials]
+    #     if current_params in existing_params:
+    #         print(f"Pruning trial {trial.number} due to duplicate parameters: {params}")
+    #         raise optuna.TrialPruned()
+    #
+    #     sharpe, _ = self.combcv_pl(params, group_dict)  # Pass group_dict to combcv_pl
+    #     return sharpe
 
     def calculate_wcss(self, data: np.ndarray, max_clusters: int) -> list:
         """
@@ -626,11 +737,20 @@ class ParameterOptimizer:
         for n_clusters in range(1, max_clusters + 1):
             clustering = AgglomerativeClustering(n_clusters=n_clusters)
             cluster_labels = clustering.fit_predict(data)
-            centroids = [data[cluster_labels == i].mean(axis=0) for i in range(n_clusters)]
-            wcss.append(sum(np.linalg.norm(data[cluster_labels == i] - centroids[i]) ** 2 for i in range(n_clusters)))
+            centroids = [
+                data[cluster_labels == i].mean(axis=0) for i in range(n_clusters)
+            ]
+            wcss.append(
+                sum(
+                    np.linalg.norm(data[cluster_labels == i] - centroids[i]) ** 2
+                    for i in range(n_clusters)
+                )
+            )
         return wcss
 
-    def find_optimal_clusters(self, param_matrix_scaled: np.ndarray, max_clusters: int) -> int:
+    def find_optimal_clusters(
+        self, param_matrix_scaled: np.ndarray, max_clusters: int
+    ) -> int:
         """
         Find the optimal number of clusters using the elbow method.
 
@@ -648,11 +768,11 @@ class ParameterOptimizer:
         elbow_point = np.argmin(second_derivative) + 2  # +2 to correct the index offset
 
         plt.figure(figsize=(10, 7))
-        plt.plot(range(1, max_clusters + 1), wcss, marker='o')
-        plt.axvline(x=elbow_point, color='r', linestyle='--')
-        plt.title('Elbow Method')
-        plt.xlabel('Number of Clusters')
-        plt.ylabel('WCSS')
+        plt.plot(range(1, max_clusters + 1), wcss, marker="o")
+        plt.axvline(x=elbow_point, color="r", linestyle="--")
+        plt.title("Elbow Method")
+        plt.xlabel("Number of Clusters")
+        plt.ylabel("WCSS")
         plt.show()
 
         return elbow_point
@@ -665,32 +785,51 @@ class ParameterOptimizer:
             dict: The aggregated best parameter set.
         """
 
-        logging.info('Starting clustering')
+        logging.info("Starting clustering")
 
         if isinstance(self.top_params_list, list):
-            param_df = pd.DataFrame(self.top_params_list).drop(columns=['sharpe']).dropna(axis=1)
+            param_df = (
+                pd.DataFrame(self.top_params_list)
+                .drop(columns=["sharpe"])
+                .dropna(axis=1)
+            )
         elif isinstance(self.top_params_list, pd.DataFrame):
-            param_df = self.top_params_list.drop(columns=['sharpe']).dropna(axis=1)
-            self.top_params_list = self.top_params_list.to_dict('records')
+            param_df = self.top_params_list.drop(columns=["sharpe"]).dropna(axis=1)
+            self.top_params_list = self.top_params_list.to_dict("records")
         else:
-            raise Exception('Wrong data format for top params, accepted formats are list/DataFrame')
+            raise Exception(
+                "Wrong data format for top params, accepted formats are list/DataFrame"
+            )
 
         max_clusters = min(max(3, len(param_df) // 3), len(param_df))
         if max_clusters > 2:
-            logging.info(f'Starting clustering with max clusters: {max_clusters}, len of param set {len(param_df)}')
+            logging.info(
+                f"Starting clustering with max clusters: {max_clusters}, len of param set {len(param_df)}"
+            )
 
             column_transformer = ColumnTransformer(
                 transformers=[
-                    ('num', StandardScaler(), make_column_selector(dtype_include=np.number)),
-                    ('cat', OneHotEncoder(), make_column_selector(dtype_exclude=np.number))
+                    (
+                        "num",
+                        StandardScaler(),
+                        make_column_selector(dtype_include=np.number),
+                    ),
+                    (
+                        "cat",
+                        OneHotEncoder(),
+                        make_column_selector(dtype_exclude=np.number),
+                    ),
                 ],
-                remainder='passthrough'
+                remainder="passthrough",
             )
 
             param_matrix_scaled = column_transformer.fit_transform(param_df)
-            best_n_clusters = self.find_optimal_clusters(param_matrix_scaled, max_clusters) if max_clusters < len(
-                param_df) else max_clusters
-            logging.info(f'Optimal number of clusters: {best_n_clusters}')
+            best_n_clusters = (
+                self.find_optimal_clusters(param_matrix_scaled, max_clusters)
+                if max_clusters < len(param_df)
+                else max_clusters
+            )
+            logging.info(f"Optimal number of clusters: {best_n_clusters}")
             clustering = AgglomerativeClustering(n_clusters=best_n_clusters)
             cluster_labels = clustering.fit_predict(param_matrix_scaled)
 
@@ -698,15 +837,19 @@ class ParameterOptimizer:
             for param, cluster in zip(self.top_params_list, cluster_labels):
                 clustered_params[cluster].append(param)
 
-            best_cluster = max(clustered_params.keys(),
-                               key=lambda c: np.mean([p['sharpe'] for p in clustered_params[c]]))
+            best_cluster = max(
+                clustered_params.keys(),
+                key=lambda c: np.mean([p["sharpe"] for p in clustered_params[c]]),
+            )
             best_cluster_params = clustered_params[best_cluster]
-            logging.info(f'Best cluster: {best_cluster_params}')
+            logging.info(f"Best cluster: {best_cluster_params}")
             best_param_set = self.aggregate_params(best_cluster_params)
         else:
-            logging.info(f'Len of params set less than 3, choosing best params out of 3')
+            logging.info(
+                f"Len of params set less than 3, choosing best params out of 3"
+            )
             best_param_set = pd.DataFrame(self.top_params_list).iloc[0].to_dict()
-        logging.info(f'Best params: {best_param_set}')
+        logging.info(f"Best params: {best_param_set}")
         return best_param_set
 
     def param_to_vector(self, param_set: dict) -> list:
@@ -753,14 +896,16 @@ class ParameterOptimizer:
 
     def read_saved_params(self, save_path: str, file_prefix: str):
 
-        logging.info('Loading saved params')
+        logging.info("Loading saved params")
 
-        top_params_df = pd.read_csv(save_path + file_prefix + 'top_params.csv')
-        self.top_params_list = top_params_df.drop(columns=['fold_num'])
-        self.all_tested_params = pd.read_csv(save_path + file_prefix + 'all_tested_params.csv').to_dict('records')
+        top_params_df = pd.read_csv(save_path + file_prefix + "top_params.csv")
+        self.top_params_list = top_params_df.drop(columns=["fold_num"])
+        self.all_tested_params = pd.read_csv(
+            save_path + file_prefix + "all_tested_params.csv"
+        ).to_dict("records")
 
-        top_params_list = top_params_df.dropna(subset='fold_num').to_dict('records')
+        top_params_list = top_params_df.dropna(subset="fold_num").to_dict("records")
         for tp in top_params_list:
-            self.best_params_by_fold[tp['fold_num']] = tp
+            self.best_params_by_fold[tp["fold_num"]] = tp
 
-        logging.info('Params loaded')
+        logging.info("Params loaded")

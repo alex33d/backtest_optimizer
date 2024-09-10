@@ -4,8 +4,8 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
-    name="Backtest-Optimizer",  
-    version="0.1.8",
+    name="Backtest-Optimizer",
+    version="0.1.9",
     author="Alexnader Demachev",
     author_email="alexdemachev@gmail.com",
     description="Hyperparameter search with Combinatorial Cross Validation",
@@ -18,15 +18,15 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.6',
+    python_requires=">=3.6",
     install_requires=[
-        'numpy',
-      'pandas',
-      'scikit-learn',
-      'optuna',
-      'matplotlib',
-      'scipy',
-      'joblib',
-      'statsmodels'
+        "numpy",
+        "pandas",
+        "scikit-learn",
+        "optuna",
+        "matplotlib",
+        "scipy",
+        "joblib",
+        "statsmodels",
     ],
 )
