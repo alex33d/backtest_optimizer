@@ -22,7 +22,7 @@ import optuna
 from optuna.pruners import BasePruner
 from multiprocessing import Pool, Manager, set_start_method, get_start_method
 import itertools
-from typing import Dict, List, Tuple
+from typing import Dict, Any, Tuple, Optional, List
 
 import matplotlib.pyplot as plt
 from itertools import combinations
@@ -974,121 +974,144 @@ class ParameterOptimizer:
         logging.info(f"Saved plot for combination {index + 1}")
 
     def plot_multiple_param_combinations_v2(
-        self, file_prefix: str, data_dict, params: dict, n_jobs: int
+        self,
+        n_jobs: int,
+        data_dict: Dict[str, pd.DataFrame],
+        params: Dict[str, Any],
+        file_prefix: str = "Results",
     ):
         """
         Calculate out-of-sample Sharpe ratio, plot cumulative returns for all combinations on a single chart,
-        and create a table with metrics and parameter sets. Update and save after each iteration.
+        and create a table with metrics and parameter sets.
 
         Args:
-            data_dict: dictionary with data in format {'ticker':DF,...}
-            params (dict): Parameters for the performance calculation. May contain lists of values.
+            data_dict (Dict[str, pd.DataFrame]): Data for processing.
+            params (Dict[str, Any]): Parameters for the performance calculation. May contain lists of values.
+            file_prefix (str): Prefix for output files.
         """
-        logging.info("Plotting results for multiple parameter combinations")
+        logging.info("Processing parameter combinations")
 
         # Generate all combinations of parameters
-        param_names = []
-        param_values = []
-        for key, value in params.items():
-            if isinstance(value, list):
-                param_names.append(key)
-                param_values.append(value)
-            else:
-                param_names.append(key)
-                param_values.append([value])
-
-        param_combinations = list(itertools.product(*param_values))
-
-        # Create shared resources
-        shared_resources = initialize_shared_resources()
-
-        # Initialize figure and axis in the main process
-        shared_resources["fig"] = Figure(figsize=(12, 8))
-        shared_resources["ax"] = shared_resources["fig"].add_subplot(111)
+        param_names = list(params.keys())
+        param_combinations = list(
+            itertools.product(
+                *[
+                    params[name] if isinstance(params[name], list) else [params[name]]
+                    for name in param_names
+                ]
+            )
+        )
+        total_combinations = len(param_combinations)
+        logging.info(f"Total parameter combinations to process: {total_combinations}")
 
         # Prepare the partial function for multiprocessing
         partial_process = partial(
-            process_combination_v2,
+            process_combination,
             data_dict=data_dict,
             param_names=param_names,
             calc_pl=self.calc_pl,
             calculate_metrics=calculate_metrics,
-            shared_resources=shared_resources,
-            save_path=self.save_path + file_prefix,
         )
 
         # Use multiprocessing to process all combinations
         with multiprocessing.Pool(n_jobs) as pool:
-            pool.map(partial_process, enumerate(param_combinations))
-
-
-def process_combination_v2(
-    enum_combination,
-    data_dict,
-    param_names,
-    calc_pl,
-    calculate_metrics,
-    shared_resources,
-    save_path,
-):
-    """Process a single parameter combination, update chart and table, and save."""
-    index, combination = enum_combination
-    param_set = dict(zip(param_names, combination))
-
-    # Calculate returns and metrics
-    returns = calc_pl(data_dict, param_set)
-    metrics = calculate_metrics(returns)
-
-    # Update shared data, chart, and table
-    with shared_resources["lock"]:
-        # Add the current returns to shared data
-        shared_resources["returns"].append((index, returns))
-
-        # Clear the current figure to prevent overlapping
-        shared_resources["ax"].clear()
-
-        # Redraw all lines from shared data
-        for i, (_, prev_returns) in enumerate(shared_resources["returns"]):
-            shared_resources["ax"].plot(
-                prev_returns.index, prev_returns.cumsum(), label=f"Combination {i + 1}"
+            results = list(
+                tqdm(
+                    pool.imap_unordered(partial_process, param_combinations),
+                    total=total_combinations,
+                )
             )
 
-        # Update legend, labels, and title
-        shared_resources["ax"].legend()
-        shared_resources["ax"].set_xlabel("Date", fontsize=14)
-        shared_resources["ax"].set_ylabel("Cumulative Returns", fontsize=14)
-        shared_resources["ax"].set_title(
-            "Cumulative Returns Over Time (All Combinations)", fontsize=16
+        # Filter out None results (from errors)
+        valid_results = [r for r in results if r is not None]
+        successful_combinations = len(valid_results)
+        logging.info(
+            f"Processed {successful_combinations} out of {total_combinations} combinations successfully"
         )
-        shared_resources["ax"].grid(True, which="both", linestyle="--", linewidth=0.5)
 
-        # Adjust the plot to fit all lines
-        shared_resources["fig"].tight_layout()
+        if not valid_results:
+            logging.warning("No valid results to process. Exiting.")
+            return
 
-        # Save updated chart
-        shared_resources["fig"].savefig(f"{save_path}All_Equity_Curves.png")
-
-        # Update table data
-        row = {"Combination": index + 1}
-        row.update(metrics)
-        row.update(param_set)
-        shared_resources["data"].append(row)
-
-        # Create and save updated table as CSV
-        df = pd.DataFrame(list(shared_resources["data"])).sort_values(
-            by="sharpe", ascending=False
+        # Create DataFrame for metrics and parameters
+        df = pd.DataFrame(
+            [
+                {**{"Combination": i + 1}, **result["metrics"], **result["params"]}
+                for i, result in enumerate(valid_results)
+            ]
         )
-        df.to_csv(f"{save_path}Metrics_and_Parameters.csv", index=False)
 
-    logging.info(f"Processed combination {index + 1} and updated chart and CSV")
+        # Sort by Sharpe ratio if available
+        if "sharpe" in df.columns:
+            df_sorted = df.sort_values(by="sharpe", ascending=False)
+        else:
+            df_sorted = df
+
+        # Save metrics and parameters as CSV
+        metrics_csv_path = os.path.join(
+            self.save_path, f"{file_prefix}Metrics_and_Parameters.csv"
+        )
+        df_sorted.to_csv(metrics_csv_path, index=False)
+        logging.info(f"Metrics and parameters saved to {metrics_csv_path}")
+
+        # Plot cumulative returns
+        self._plot_cumulative_returns(valid_results, file_prefix)
+
+    def _plot_cumulative_returns(self, results: List[Dict[str, Any]], file_prefix: str):
+        """
+        Plot cumulative returns for all combinations.
+
+        Args:
+            results (List[Dict[str, Any]]): List of processed results.
+            file_prefix (str): Prefix for the plot file name.
+        """
+        plt.figure(figsize=(12, 8))
+        for i, result in enumerate(results, 1):
+            returns = result["returns"]
+            plt.plot(returns.index, returns.cumsum(), label=f"Combination {i}")
+
+        plt.xlabel("Date", fontsize=14)
+        plt.ylabel("Cumulative Returns", fontsize=14)
+        plt.title("Cumulative Returns Over Time (All Combinations)", fontsize=16)
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+        # Save the cumulative returns plot
+        plot_path = os.path.join(self.save_path, f"{file_prefix}All_Equity_Curves.png")
+        plt.savefig(plot_path)
+        plt.close()
+        logging.info(f"Cumulative returns plot saved to {plot_path}")
 
 
-def initialize_shared_resources():
-    manager = multiprocessing.Manager()
-    return {
-        "lock": manager.Lock(),
-        "data": manager.list(),
-        "returns": manager.list(),
-        "fig": None,  # We'll initialize this in the main process
-        "ax": None,  # We'll initialize this in the main process
-    }
+def process_combination(
+    combination: Tuple[Any, ...],
+    data_dict: Dict[str, pd.DataFrame],
+    param_names: List[str],
+    calc_pl: Any,
+    calculate_metrics: Any,
+) -> Optional[Dict[str, Any]]:
+    """
+    Process a single parameter combination and return the results.
+
+    Args:
+        combination (Tuple[Any, ...]): A tuple of parameter values.
+        data_dict (Dict[str, pd.DataFrame]): Data for processing.
+        param_names (List[str]): Names of the parameters.
+        calc_pl (Callable): Function to calculate returns.
+        calculate_metrics (Callable): Function to calculate metrics.
+
+    Returns:
+        Optional[Dict[str, Any]]: Dictionary containing parameters, returns, and metrics, or None if failed.
+    """
+    param_set = dict(zip(param_names, combination))
+
+    try:
+        # Calculate returns and metrics
+        returns = calc_pl(data_dict, param_set)
+        metrics = calculate_metrics(returns)
+
+        return {"params": param_set, "returns": returns, "metrics": metrics}
+    except Exception as e:
+        logging.error(f"Error processing combination {param_set}: {str(e)}")
+        return None
