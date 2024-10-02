@@ -99,13 +99,13 @@ def calc_returns(args):
 
 
 class ParameterOptimizer:
-    def __init__(self, calc_pl: callable, save_path: str):
+    def __init__(self, calc_pl: callable, save_path: str, save_file_prefix: str):
         """
         Initialize the parameter optimizer.
 
         Args:
             calc_pl (callable): Function to calculate performance metrics.
-            save_path: path for saving and loading results (fodler)
+            save_path: path for saving and loading results (folder)
         """
         self.calc_pl = calc_pl
         self.combcv_dict = {}
@@ -118,7 +118,7 @@ class ParameterOptimizer:
         self.train_data = {}
         self.test_data = {}
         self.save_path = save_path
-        self.file_prefix = None
+        self.file_prefix = save_file_prefix
 
     def check_datetime_index_integrity(
         self, data_dict: Dict[str, pd.DataFrame]
@@ -374,32 +374,46 @@ class ParameterOptimizer:
             params (dict): Parameters for the performance calculation.
         """
 
-        logging.info("Plotting results")
+        def plot_results(returns, save_file_name):
+            metrics = calculate_metrics(returns)
+            text = ""
+            for metric, v in metrics.items():
+                text += f"{metric}: {round(v, 2)}\n"
+
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.plot(returns.cumsum())
+            props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+            ax.text(
+                0.05,
+                0.95,
+                text,
+                transform=ax.transAxes,
+                fontsize=12,
+                verticalalignment="top",
+                bbox=props,
+            )
+            ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+            ax.set_xlabel("Date", fontsize=14)
+            ax.set_ylabel("Cumulative Returns", fontsize=14)
+            ax.set_title(f"{save_file_name}", fontsize=16)
+            plt.savefig(self.save_path + save_file_name)
+            plt.show()
+
+        logging.info("Plotting returns")
 
         returns = self.calc_pl(data_dict, params)
-        metrics = calculate_metrics(returns)
-        text = ""
-        for metric, v in metrics.items():
-            text += f"{metric}: {round(v, 2)}\n"
 
-        fig, ax = plt.subplots(figsize=(12, 8))
-        ax.plot(returns.cumsum())
-        props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
-        ax.text(
-            0.05,
-            0.95,
-            text,
-            transform=ax.transAxes,
-            fontsize=12,
-            verticalalignment="top",
-            bbox=props,
-        )
-        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
-        ax.set_xlabel("Date", fontsize=14)
-        ax.set_ylabel("Cumulative Returns", fontsize=14)
-        ax.set_title("Cumulative Returns Over Time", fontsize=16)
-        plt.savefig(self.save_path + "Equity_curve.png")
-        plt.show()
+        if isinstance(returns, pd.Series):
+            plot_results(returns, self.file_prefix + "total_returns.png")
+        elif isinstance(returns, dict):
+            for returns_type, returns_series in returns.items():
+                plot_results(
+                    returns_series, self.file_prefix + f"{returns_type}_returns.png"
+                )
+        else:
+            raise Exception(
+                "Wrong data type for plotting returns, accepted types are pd.Series and dict"
+            )
 
     def create_combcv_dict(self, n_splits: int, n_test_splits: int):
         """
@@ -469,7 +483,6 @@ class ParameterOptimizer:
         n_jobs: int,
         n_runs: int,
         best_trials_pct: float,
-        file_prefix: str = None,
     ):
         """
         Optimize parameters using Optuna.
@@ -573,12 +586,13 @@ class ParameterOptimizer:
                     "sharpe", ascending=False
                 )
                 param_df.to_csv(
-                    self.save_path + file_prefix + "top_params.csv", index=False
+                    self.save_path + self.file_prefix + "top_params.csv", index=False
                 )
 
                 all_tested_params_df = pd.DataFrame(self.all_tested_params)
                 all_tested_params_df.to_csv(
-                    self.save_path + file_prefix + "all_tested_params.csv", index=False
+                    self.save_path + self.file_prefix + "all_tested_params.csv",
+                    index=False,
                 )
                 logging.info(f"Interim optimization results saved to {self.save_path}")
 
@@ -868,14 +882,16 @@ class ParameterOptimizer:
                 aggregated[key] = max(set(values), key=values.count)
         return aggregated
 
-    def read_saved_params(self, file_prefix: str):
+    def read_saved_params(self):
 
         logging.info("Loading saved params")
 
-        top_params_df = pd.read_csv(self.save_path + file_prefix + "top_params.csv")
+        top_params_df = pd.read_csv(
+            self.save_path + self.file_prefix + "top_params.csv"
+        )
         self.top_params_list = top_params_df.drop(columns=["fold_num"])
         self.all_tested_params = pd.read_csv(
-            self.save_path + file_prefix + "all_tested_params.csv"
+            self.save_path + self.file_prefix + "all_tested_params.csv"
         ).to_dict("records")
 
         top_params_list = top_params_df.dropna(subset="fold_num").to_dict("records")
@@ -883,52 +899,6 @@ class ParameterOptimizer:
             self.best_params_by_fold[tp["fold_num"]] = tp
 
         logging.info("Params loaded")
-
-    def plot_multiple_param_combinations(self, data_dict, params: dict, n_jobs: int):
-        """
-        Calculate out-of-sample Sharpe ratio and plot cumulative returns for multiple parameter combinations.
-
-        Args:
-            data_dict: dictionary with data in format {'ticker':DF,...}
-            params (dict): Parameters for the performance calculation. May contain lists of values.
-            n_jobs: number of processes
-        """
-
-        logging.info("Plotting results for multiple parameter combinations")
-
-        # Generate all combinations of parameters
-        param_names = []
-        param_values = []
-        for key, value in params.items():
-            if isinstance(value, list):
-                param_names.append(key)
-                param_values.append(value)
-            else:
-                param_names.append(key)
-                param_values.append([value])
-
-        param_combinations = list(itertools.product(*param_values))
-
-        # Prepare the partial function for multiprocessing
-        partial_process = partial(
-            self._process_combination, data_dict=data_dict, param_names=param_names
-        )
-
-        # Use multiprocessing to calculate returns, plot and save for all combinations
-        with Pool(n_jobs) as pool:
-            pool.map(partial_process, enumerate(param_combinations))
-
-    def _process_combination(self, enum_combination, data_dict, param_names):
-        """Process a single parameter combination, plot and save results."""
-        index, combination = enum_combination
-        param_set = dict(zip(param_names, combination))
-
-        # Calculate returns and metrics
-        returns = self.calc_pl(data_dict, param_set)
-        metrics = calculate_metrics(returns)
-
-        # Plot and save
-        self._plot_and_save(returns, metrics, param_set, index)
 
     def _plot_and_save(self, returns, metrics, param_set, index):
         """Plot and save results for a single parameter combination."""
@@ -973,12 +943,11 @@ class ParameterOptimizer:
 
         logging.info(f"Saved plot for combination {index + 1}")
 
-    def plot_multiple_param_combinations_v2(
+    def plot_multiple_param_combinations(
         self,
         n_jobs: int,
         data_dict: Dict[str, pd.DataFrame],
         params: Dict[str, Any],
-        file_prefix: str = "Results",
     ):
         """
         Calculate out-of-sample Sharpe ratio, plot cumulative returns for all combinations on a single chart,
@@ -1049,15 +1018,15 @@ class ParameterOptimizer:
 
         # Save metrics and parameters as CSV
         metrics_csv_path = os.path.join(
-            self.save_path, f"{file_prefix}Metrics_and_Parameters.csv"
+            self.save_path, f"{self.file_prefix}Metrics_and_Parameters.csv"
         )
         df_sorted.to_csv(metrics_csv_path, index=False)
         logging.info(f"Metrics and parameters saved to {metrics_csv_path}")
 
         # Plot cumulative returns
-        self._plot_cumulative_returns(valid_results, file_prefix)
+        self._plot_cumulative_returns(valid_results)
 
-    def _plot_cumulative_returns(self, results: List[Dict[str, Any]], file_prefix: str):
+    def _plot_cumulative_returns(self, results: List[Dict[str, Any]]):
         """
         Plot cumulative returns for all combinations.
 
@@ -1078,7 +1047,9 @@ class ParameterOptimizer:
         plt.tight_layout()
 
         # Save the cumulative returns plot
-        plot_path = os.path.join(self.save_path, f"{file_prefix}All_Equity_Curves.png")
+        plot_path = os.path.join(
+            self.save_path, f"{self.file_prefix}All_Equity_Curves.png"
+        )
         plt.savefig(plot_path)
         plt.close()
         logging.info(f"Cumulative returns plot saved to {plot_path}")
@@ -1109,6 +1080,8 @@ def process_combination(
     try:
         # Calculate returns and metrics
         returns = calc_pl(data_dict, param_set)
+        if isinstance(returns, dict):
+            returns = returns["Total"]
         metrics = calculate_metrics(returns)
 
         return {"params": param_set, "returns": returns, "metrics": metrics}

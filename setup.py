@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name="Backtest-Optimizer",
-    version="0.2.2",
+    version="0.2.3",
     author="Alexnader Demachev",
     author_email="alexdemachev@gmail.com",
     description="Hyperparameter search with Combinatorial Cross Validation",
