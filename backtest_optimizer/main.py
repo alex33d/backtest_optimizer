@@ -1,5 +1,6 @@
 import sys
 import os
+from datetime import timedelta
 
 # Get the directory of the current script
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -177,32 +178,47 @@ class ParameterOptimizer:
 
             # Check for gaps in the index
             if len(df) > 1:
-                freq = pd.infer_freq(df.index)
+                time_diff = df.index.to_series().diff()
+                freq = time_diff.median()
                 if freq is not None:
                     ideal_index = pd.date_range(
                         start=df.index.min(), end=df.index.max(), freq=freq
                     )
                     gaps = ideal_index.difference(df.index)
                     if len(gaps) > 0:
+                        gap_ranges = []
+                        start = end = None
+                        for i, gap in enumerate(gaps):
+                            if start is None:
+                                start = end = gap
+                            elif gap == end + freq:
+                                end = gap
+                            else:
+                                if start == end:
+                                    gap_ranges.append(f"{start}")
+                                else:
+                                    gap_ranges.append(f"{start} to {end}")
+                                start = end = gap
+
+                            if i == len(gaps) - 1:  # Last iteration
+                                if start == end:
+                                    gap_ranges.append(f"{start}")
+                                else:
+                                    gap_ranges.append(f"{start} to {end}")
+
+                        gap_info = ", ".join(gap_ranges)
                         error_messages.append(
-                            f"DataFrame for {ticker} has {len(gaps)} gaps in its index."
+                            f"DataFrame for {ticker} has gaps in its index. "
+                            f"Missing ranges: {gap_info}"
                         )
                 else:
                     error_messages.append(
                         f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps."
                     )
 
-            # Check for future dates
-            if df.index.max() > pd.Timestamp.now():
-                error_messages.append(f"DataFrame for {ticker} contains future dates.")
-
-            # Check for very old dates (e.g., before year 2000)
-            if df.index.min() < pd.Timestamp("2000-01-01"):
-                error_messages.append(
-                    f"DataFrame for {ticker} contains very old dates (before year 2000)."
-                )
-
-        return len(error_messages) == 0, error_messages
+        if not len(error_messages) == 0:
+            for message in error_messages:
+                print(message)
 
     def align_dataframes_to_max_index(self, data_dict: dict):
         # Find the maximum date range
@@ -236,6 +252,8 @@ class ParameterOptimizer:
             train_end (str): The end date for the training data.
         """
         logging.info(f"Splitting data to train-test, cutoff: {train_end}")
+
+        self.check_datetime_index_integrity(data_dict)
 
         data_dict = self.align_dataframes_to_max_index(data_dict)
 
@@ -336,10 +354,7 @@ class ParameterOptimizer:
 
         logging.info("Checking datetime integrity for tickers")
         for i, data_dict in group_dict.items():
-            integrity_check, messages = self.check_datetime_index_integrity(data_dict)
-            if not integrity_check:
-                for message in messages:
-                    print(message)
+            self.check_datetime_index_integrity(data_dict)
 
         return group_dict
 
