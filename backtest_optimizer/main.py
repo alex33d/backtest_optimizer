@@ -8,8 +8,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 # Add the current directory to the PYTHONPATH
 sys.path.append(current_dir)
 
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
+from pandas import DataFrame
 import multiprocessing
 import numpy as np
 import pandas as pd
@@ -23,8 +22,7 @@ import optuna
 from optuna.pruners import BasePruner
 from multiprocessing import Pool, Manager, set_start_method, get_start_method
 import itertools
-from typing import Dict, Any, Tuple, Optional, List
-
+from typing import Any, List, Dict, Union, Tuple, Optional
 import matplotlib.pyplot as plt
 from itertools import combinations
 from collections.abc import Iterable
@@ -32,6 +30,7 @@ from functools import partial
 import logging
 import matplotlib
 import itertools as itt
+import threading
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
@@ -60,29 +59,6 @@ class RepeatPruner(BasePruner):
         return False
 
 
-def standalone_combcv_pl(calc_pl, params: dict, group_dict: dict) -> tuple:
-    """
-    Calculate performance metrics using combinatorial cross-validation.
-
-    Args:
-        calc_pl (callable): Function to calculate performance.
-        params (dict): Parameters for the performance calculation.
-        group_dict (dict): Dictionary of group data.
-
-    Returns:
-        tuple: (final_sharpe, final_returns) calculated metrics.
-    """
-    final_returns = []
-    for group_num, group_data in group_dict.items():
-        group_data = group_data.copy()
-        returns = calc_pl(group_data, params)
-        final_returns.append(returns)
-
-    sharpe_ratios = [
-        annual_sharpe(returns) for returns in final_returns if not returns.empty
-    ]
-    final_sharpe = np.nanmean(sharpe_ratios)
-    return final_sharpe, final_returns
 
 
 def calc_returns(args):
@@ -116,6 +92,7 @@ class ParameterOptimizer:
         self.backtest_paths = {}
         self.top_params_list = None
         self.current_group = None
+        self.train_group_dict = None
         self.train_data = {}
         self.test_data = {}
         self.save_path = save_path
@@ -341,7 +318,6 @@ class ParameterOptimizer:
         for ticker, df in self.train_data.items():
             if ticker not in self.current_group:
                 continue
-            df = df.copy()
             select_idx = self.current_group[ticker]["train"]
             if self.current_group[ticker]["test"] and not is_train:
                 select_idx = self.current_group[ticker]["test"]
@@ -355,7 +331,10 @@ class ParameterOptimizer:
         logging.info("Checking datetime integrity for tickers")
         for i, data_dict in group_dict.items():
             self.check_datetime_index_integrity(data_dict)
-
+            data_dict = {
+                ticker: ImmutableDataFrame(df) for ticker, df in data_dict.items()
+            }
+            group_dict[i] = data_dict
         return group_dict
 
     def combcv_pl(self, params: dict, group_dict: dict) -> tuple:
@@ -492,6 +471,34 @@ class ParameterOptimizer:
                             "test": test_indices,
                         }
 
+    def objective(self, trial: optuna.Trial) -> float:
+        trial_params = {}
+        for k, v in self.params_dict.items():
+            if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+                trial_params[k] = v
+            elif all(isinstance(item, int) for item in v):
+                trial_params[k] = trial.suggest_categorical(k, v)
+            elif any(isinstance(item, float) for item in v):
+                trial_params[k] = trial.suggest_categorical(k, v)
+            else:
+                trial_params[k] = trial.suggest_categorical(k, v)
+
+        current_params = trial.params
+        existing_trials = trial.study.get_trials(deepcopy=False)
+        completed_trials = [
+            t for t in existing_trials if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        existing_params = [t.params for t in completed_trials]
+        if current_params in existing_params:
+            logging.info(
+                f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
+            )
+            raise optuna.TrialPruned()
+
+        # Access self.train_group_dict directly
+        sharpe, _ = self.combcv_pl(trial_params, self.train_group_dict)
+        return sharpe
+
     def optimize(
         self,
         params: dict,
@@ -510,53 +517,23 @@ class ParameterOptimizer:
             save_file_name (str, optional): File name to save the results.
         """
         result = []
-        params_dict = params.copy()
+        self.params_dict = params.copy()
         all_tested_params = []
-        combcv_pl = partial(standalone_combcv_pl, self.calc_pl)
-
-        def objective(trial: optuna.Trial, group_dict: dict) -> float:
-            trial_params = {}
-            for k, v in params_dict.items():
-                if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
-                    trial_params[k] = v
-                elif all(isinstance(item, int) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
-                elif any(isinstance(item, float) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
-                else:
-                    trial_params[k] = trial.suggest_categorical(k, v)
-
-            current_params = trial.params
-            existing_trials = trial.study.get_trials(deepcopy=False)
-            completed_trials = [
-                t
-                for t in existing_trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-            existing_params = [t.params for t in completed_trials]
-            if current_params in existing_params:
-                logging.info(
-                    f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
-                )
-                raise optuna.TrialPruned()
-
-            sharpe, _ = combcv_pl(trial_params, group_dict)
-            return sharpe
 
         # Create the objective function closure
         for fold_num, train_test_splits in self.combcv_dict.items():
             logging.info(f"Starting optimization for group: {fold_num}")
             self.current_group = train_test_splits
-            train_group_dict = self.generate_group_dict(is_train=True)
+            self.train_group_dict = self.generate_group_dict(is_train=True)
 
             study = optuna.create_study(
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(multivariate=True),
             )
             study.optimize(
-                lambda trial: objective(trial, train_group_dict),
+                self.objective,
                 n_trials=n_runs,
-                n_jobs=n_jobs,
+                n_jobs=n_jobs,  # Set to a positive integer
             )
 
             all_trials = sorted(
@@ -571,7 +548,7 @@ class ParameterOptimizer:
             )
             all_trials = [trial.params for trial in all_trials]
             for trial_params in all_trials:
-                for key, value in params_dict.items():
+                for key, value in self.params_dict.items():
                     trial_params.setdefault(key, value)
             all_tested_params.extend(all_trials)
             top_params = all_trials[: max(1, int(len(all_trials) * best_trials_pct))]
@@ -579,7 +556,7 @@ class ParameterOptimizer:
 
             test_group_dict = self.generate_group_dict(is_train=False)
             for i, trial_params in enumerate(top_params):
-                sharpe, returns_list = combcv_pl(trial_params, test_group_dict)
+                sharpe, returns_list = self.combcv_pl(trial_params, test_group_dict)
                 if i == 0:
                     trial_params["fold_num"] = fold_num
                 else:
@@ -1103,3 +1080,99 @@ def process_combination(
     except Exception as e:
         logging.error(f"Error processing combination {param_set}: {str(e)}")
         return None
+
+
+class ImmutableDataFrame:
+    """
+    A thread-safe immutable wrapper for pandas DataFrame.
+    Prevents any modifications to the underlying data while allowing read operations.
+    """
+
+    def __init__(self, data: Union[DataFrame, Dict, List]):
+        if isinstance(data, DataFrame):
+            self._df = data  # Do not copy the DataFrame
+        else:
+            self._df = DataFrame(data)
+
+        # Freeze the DataFrame by making it immutable
+        self._df.flags.writeable = False
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Delegate read-only operations to the underlying DataFrame.
+        Block any operations that could modify the DataFrame.
+        """
+        forbidden_methods = {
+            "iloc",
+            "loc",
+            "at",
+            "iat",  # Direct access modifiers
+            "drop",
+            "drop_duplicates",
+            "dropna",  # Data removal
+            "fillna",
+            "ffill",
+            "bfill",
+            "replace",
+            "update",  # Data modification
+            "set_index",
+            "reset_index",  # Index modification
+            "assign",
+            "insert",
+            "append",  # Data addition
+        }
+
+        if name in forbidden_methods:
+            raise AttributeError(
+                f"'{name}' operation is not allowed on ImmutableDataFrame"
+            )
+
+        attr = getattr(self._df, name)
+
+        if callable(attr):
+
+            def wrapped_method(*args, **kwargs):
+                result = attr(*args, **kwargs)
+                if isinstance(result, DataFrame):
+                    return ImmutableDataFrame(result)
+                return result
+
+            return wrapped_method
+        return attr
+
+    def __repr__(self) -> str:
+        return f"ImmutableDataFrame(\n{self._df.__repr__()})"
+
+    def __str__(self) -> str:
+        return self._df.__str__()
+
+    # Safe read-only operations
+    def head(self, n: int = 5) -> "ImmutableDataFrame":
+        return ImmutableDataFrame(self._df.head(n))
+
+    def tail(self, n: int = 5) -> "ImmutableDataFrame":
+        return ImmutableDataFrame(self._df.tail(n))
+
+    def copy(self) -> "ImmutableDataFrame":
+        return ImmutableDataFrame(self._df.copy())
+
+    @property
+    def values(self):
+        return self._df.values
+
+    @property
+    def columns(self):
+        return self._df.columns
+
+    @property
+    def index(self):
+        return self._df.index
+
+    def to_dict(self) -> Dict:
+        return self._df.to_dict()
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Return a shallow copy of the DataFrame for safe modifications."""
+        df_copy = self._df.copy(deep=False)  # Create a shallow copy
+        df_copy.values.flags.writeable = True  # Allow modifications
+        return df_copy
