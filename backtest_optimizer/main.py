@@ -22,7 +22,7 @@ import optuna
 from optuna.pruners import BasePruner
 from multiprocessing import Pool, Manager, set_start_method, get_start_method
 import itertools
-from typing import Any, List, Dict, Union, Tuple, Optional
+from typing import Any, List, Dict, Union, Tuple, Optional, Set
 import matplotlib.pyplot as plt
 from itertools import combinations
 from collections.abc import Iterable
@@ -31,6 +31,8 @@ import logging
 import matplotlib
 import itertools as itt
 import threading
+from itertools import groupby
+from operator import itemgetter
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
@@ -59,8 +61,6 @@ class RepeatPruner(BasePruner):
         return False
 
 
-
-
 def calc_returns(args):
     calc_pl_func, params, train_data = args
     try:
@@ -76,7 +76,9 @@ def calc_returns(args):
 
 
 class ParameterOptimizer:
-    def __init__(self, calc_pl: callable, save_path: str, save_file_prefix: str):
+    def __init__(
+        self, calc_pl: callable, save_path: str, save_file_prefix: str, n_jobs: int
+    ):
         """
         Initialize the parameter optimizer.
 
@@ -97,20 +99,21 @@ class ParameterOptimizer:
         self.test_data = {}
         self.save_path = save_path
         self.file_prefix = save_file_prefix
+        self.n_jobs = n_jobs
 
     def check_datetime_index_integrity(
         self, data_dict: Dict[str, pd.DataFrame]
     ) -> Tuple[bool, List[str]]:
         """
-        Check the integrity of datetime indices in a dictionary of DataFrames.
+        Check the integrity of datetime indices in a dictionary of DataFrames using parallel processing.
 
         Args:
-        data_dict (Dict[str, pd.DataFrame]): Dictionary of DataFrames with datetime indices.
+            data_dict (Dict[str, pd.DataFrame]): Dictionary of DataFrames with datetime indices.
 
         Returns:
-        Tuple[bool, List[str]]: A tuple containing:
-            - Boolean indicating overall integrity (True if all checks pass)
-            - List of error messages (empty if all checks pass)
+            Tuple[bool, List[str]]: A tuple containing:
+                - Boolean indicating overall integrity (True if all checks pass)
+                - List of error messages (empty if all checks pass)
         """
         error_messages = []
 
@@ -121,81 +124,28 @@ class ParameterOptimizer:
 
         # Collect all unique dates across all DataFrames
         all_dates = set()
-        for ticker, df in data_dict.items():
-            # Check if index is DatetimeIndex
-            if not isinstance(df.index, pd.DatetimeIndex):
-                error_messages.append(
-                    f"DataFrame for {ticker} does not have a DatetimeIndex."
-                )
-                continue
+        for df in data_dict.values():
+            if isinstance(df.index, pd.DatetimeIndex):
+                all_dates.update(df.index)
 
-            all_dates.update(df.index)
+        if not all_dates:
+            error_messages.append("No valid DatetimeIndex found in any DataFrame.")
+            return False, error_messages
 
-        all_dates = sorted(all_dates)
+        # Prepare arguments for parallel processing
+        # Option 1: Modify check_single_dataframe to accept all_dates as keyword
+        # Ensure check_single_dataframe is defined to accept all_dates as keyword
+        check_func = partial(check_single_dataframe, all_dates=all_dates)
+        items = [(ticker, df) for ticker, df in data_dict.items()]
 
-        for ticker, df in data_dict.items():
-            # Check for duplicate indices
-            if df.index.duplicated().any():
-                error_messages.append(
-                    f"DataFrame for {ticker} contains duplicate timestamps."
-                )
+        # Use multiprocessing to check DataFrames in parallel
+        with Pool(processes=self.n_jobs) as pool:
+            results = pool.starmap(check_func, items)
 
-            # Check if index is sorted
-            if not df.index.is_monotonic_increasing:
-                error_messages.append(
-                    f"Index for {ticker} is not monotonically increasing."
-                )
+        # Flatten results and collect all error messages
+        error_messages = [error for sublist in results for error in sublist]
 
-            # Check for missing dates
-            missing_dates = set(all_dates) - set(df.index)
-            if missing_dates:
-                error_messages.append(
-                    f"DataFrame for {ticker} is missing {len(missing_dates)} dates."
-                )
-
-            # Check for gaps in the index
-            if len(df) > 1:
-                time_diff = df.index.to_series().diff()
-                freq = time_diff.median()
-                if freq is not None:
-                    ideal_index = pd.date_range(
-                        start=df.index.min(), end=df.index.max(), freq=freq
-                    )
-                    gaps = ideal_index.difference(df.index)
-                    if len(gaps) > 0:
-                        gap_ranges = []
-                        start = end = None
-                        for i, gap in enumerate(gaps):
-                            if start is None:
-                                start = end = gap
-                            elif gap == end + freq:
-                                end = gap
-                            else:
-                                if start == end:
-                                    gap_ranges.append(f"{start}")
-                                else:
-                                    gap_ranges.append(f"{start} to {end}")
-                                start = end = gap
-
-                            if i == len(gaps) - 1:  # Last iteration
-                                if start == end:
-                                    gap_ranges.append(f"{start}")
-                                else:
-                                    gap_ranges.append(f"{start} to {end}")
-
-                        gap_info = ", ".join(gap_ranges)
-                        error_messages.append(
-                            f"DataFrame for {ticker} has gaps in its index. "
-                            f"Missing ranges: {gap_info}"
-                        )
-                else:
-                    error_messages.append(
-                        f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps."
-                    )
-
-        if not len(error_messages) == 0:
-            for message in error_messages:
-                print(message)
+        return len(error_messages) == 0, error_messages
 
     def align_dataframes_to_max_index(self, data_dict: dict):
         # Find the maximum date range
@@ -502,7 +452,6 @@ class ParameterOptimizer:
     def optimize(
         self,
         params: dict,
-        n_jobs: int,
         n_runs: int,
         best_trials_pct: float,
     ):
@@ -533,7 +482,7 @@ class ParameterOptimizer:
             study.optimize(
                 self.objective,
                 n_trials=n_runs,
-                n_jobs=n_jobs,  # Set to a positive integer
+                n_jobs=self.n_jobs,  # Set to a positive integer
             )
 
             all_trials = sorted(
@@ -1176,3 +1125,72 @@ class ImmutableDataFrame:
         df_copy = self._df.copy(deep=False)  # Create a shallow copy
         df_copy.values.flags.writeable = True  # Allow modifications
         return df_copy
+
+
+def check_single_dataframe(
+    ticker: str, df: pd.DataFrame, all_dates: Set[pd.Timestamp]
+) -> List[str]:
+    """
+    Check integrity of a single DataFrame.
+
+    Args:
+        ticker (str): The identifier for the DataFrame
+        df (pd.DataFrame): The DataFrame to check
+        all_dates (Set[pd.Timestamp]): Set of all unique dates across all DataFrames
+
+    Returns:
+        List[str]: List of error messages for this DataFrame
+    """
+    errors = []
+
+    # Check if index is DatetimeIndex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return [f"DataFrame for {ticker} does not have a DatetimeIndex."]
+
+    # Check for duplicate indices
+    if df.index.duplicated().any():
+        errors.append(f"DataFrame for {ticker} contains duplicate timestamps.")
+
+    # Check if index is sorted
+    if not df.index.is_monotonic_increasing:
+        errors.append(f"Index for {ticker} is not monotonically increasing.")
+
+    # Check for missing dates
+    missing_dates = all_dates - set(df.index)
+    if missing_dates:
+        errors.append(f"DataFrame for {ticker} is missing {len(missing_dates)} dates.")
+
+    # Check for gaps in the index
+    if len(df) > 1:
+        time_diff = df.index.to_series().diff().dropna()
+        freq = time_diff.mode()[0] if not time_diff.mode().empty else None
+        if freq is not None:
+            ideal_index = pd.date_range(
+                start=df.index.min(), end=df.index.max(), freq=freq
+            )
+            gaps = ideal_index.difference(df.index)
+            if len(gaps) > 0:
+                # Group consecutive gaps
+                gap_groups = []
+                sorted_gaps = sorted(gaps)
+                for k, g in groupby(
+                    enumerate(sorted_gaps),
+                    lambda x: x[0] - x[1].to_pydatetime().timestamp(),
+                ):
+                    group = list(map(itemgetter(1), g))
+                    gap_groups.append((group[0], group[-1]))
+
+                gap_info = ", ".join(
+                    f"{start}" if start == end else f"{start} to {end}"
+                    for start, end in gap_groups
+                )
+                errors.append(
+                    f"DataFrame for {ticker} has gaps in its index. "
+                    f"Missing ranges: {gap_info}"
+                )
+        else:
+            errors.append(
+                f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps."
+            )
+
+    return errors
