@@ -174,8 +174,6 @@ class ParameterOptimizer:
         # Process DataFrames in parallel with optimized arguments
         check_func = partial(
             check_single_dataframe,
-            min_date=min_date,
-            max_date=max_date,
             expected_freq=expected_freq,
         )
 
