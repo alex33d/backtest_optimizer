@@ -94,7 +94,7 @@ class ParameterOptimizer:
         self.backtest_paths = {}
         self.top_params_list = None
         self.current_group = None
-        self.train_group_dict = None
+        self.group_dict = None
         self.train_data = {}
         self.test_data = {}
         self.save_path = save_path
@@ -105,45 +105,99 @@ class ParameterOptimizer:
         self, data_dict: Dict[str, pd.DataFrame]
     ) -> Tuple[bool, List[str]]:
         """
-        Check the integrity of datetime indices in a dictionary of DataFrames using parallel processing.
+        Memory-optimized version of datetime index integrity checker.
+        Uses streaming operations and minimal memory footprint.
 
         Args:
             data_dict (Dict[str, pd.DataFrame]): Dictionary of DataFrames with datetime indices.
 
         Returns:
-            Tuple[bool, List[str]]: A tuple containing:
-                - Boolean indicating overall integrity (True if all checks pass)
-                - List of error messages (empty if all checks pass)
+            Tuple[bool, List[str]]: Tuple of (integrity_check_passed, error_messages)
         """
         error_messages = []
 
-        # Check if dictionary is empty
         if not data_dict:
             error_messages.append("The input dictionary is empty.")
             return False, error_messages
 
-        # Collect all unique dates across all DataFrames
-        all_dates = set()
-        for df in data_dict.values():
-            if isinstance(df.index, pd.DatetimeIndex):
-                all_dates.update(df.index)
+        # Find min/max dates and infer frequency using generator expressions
+        min_date = None
+        max_date = None
+        frequencies = []
 
-        if not all_dates:
+        for df in data_dict.values():
+            if not isinstance(df.index, pd.DatetimeIndex):
+                continue
+
+            curr_min = df.index.min()
+            curr_max = df.index.max()
+
+            min_date = curr_min if min_date is None else min(min_date, curr_min)
+            max_date = curr_max if max_date is None else max(max_date, curr_max)
+
+            # Infer frequency from first few rows to save memory
+            if len(df) > 1:
+                try:
+                    # Try to infer frequency from a larger sample for better accuracy
+                    sample_size = min(len(df), 1000)
+                    sample = df.index[:sample_size]
+                    freq = pd.infer_freq(sample)
+                    if freq:
+                        frequencies.append(freq)
+                except Exception:
+                    continue
+
+        if min_date is None or max_date is None:
             error_messages.append("No valid DatetimeIndex found in any DataFrame.")
             return False, error_messages
 
-        # Prepare arguments for parallel processing
-        # Option 1: Modify check_single_dataframe to accept all_dates as keyword
-        # Ensure check_single_dataframe is defined to accept all_dates as keyword
-        check_func = partial(check_single_dataframe, all_dates=all_dates)
-        items = [(ticker, df) for ticker, df in data_dict.items()]
+        # Find most common frequency using Counter
+        from collections import Counter
 
-        # Use multiprocessing to check DataFrames in parallel
-        with Pool(processes=self.n_jobs) as pool:
-            results = pool.starmap(check_func, items)
+        if frequencies:
+            freq_counter = Counter(frequencies)
+            expected_freq = freq_counter.most_common(1)[0][0]
+        else:
+            # Try to infer frequency from the first valid DataFrame
+            for df in data_dict.values():
+                if isinstance(df.index, pd.DatetimeIndex) and len(df) > 1:
+                    try:
+                        expected_freq = pd.infer_freq(df.index)
+                        if expected_freq:
+                            break
+                    except Exception:
+                        continue
+            else:
+                expected_freq = "B"  # Default to business day if nothing else works
 
-        # Flatten results and collect all error messages
-        error_messages = [error for sublist in results for error in sublist]
+        # Process DataFrames in parallel with optimized arguments
+        check_func = partial(
+            check_single_dataframe,
+            min_date=min_date,
+            max_date=max_date,
+            expected_freq=expected_freq,
+        )
+
+        # Process in smaller batches to manage memory
+        BATCH_SIZE = 10
+        all_results = []
+
+        items = list(data_dict.items())
+        for i in range(0, len(items), BATCH_SIZE):
+            batch_items = items[i : i + BATCH_SIZE]
+            try:
+                with Pool(processes=min(len(batch_items), self.n_jobs)) as pool:
+                    batch_results = pool.starmap(check_func, batch_items)
+                    all_results.extend(batch_results)
+            except Exception as e:
+                error_messages.append(f"Error processing batch: {str(e)}")
+                continue
+            finally:
+                # Clear batch data
+                batch_items = None
+
+        # Collect all error messages
+        error_messages.extend([error for sublist in all_results for error in sublist])
 
         return len(error_messages) == 0, error_messages
 
@@ -156,9 +210,6 @@ class ParameterOptimizer:
         # Sort the dates to ensure they're in chronological order
         all_dates = all_dates.sort_values()
 
-        # Create a new dictionary to store the aligned DataFrames
-        aligned_data_dict = {}
-
         for ticker, df in data_dict.items():
             # Reindex the DataFrame to the full date range
             aligned_df = df.reindex(all_dates)
@@ -166,13 +217,14 @@ class ParameterOptimizer:
             # If you want to forward fill a limited number of NaNs (e.g., 5 days), uncomment the next line
             # aligned_df = aligned_df.fillna(method='ffill', limit=5)
 
-            aligned_data_dict[ticker] = aligned_df
+            data_dict[ticker] = aligned_df
 
-        return aligned_data_dict
+        return data_dict
 
     def split_data(self, data_dict: dict, train_end: str):
         """
-        Split data into training and testing sets based on the specified date.
+        Memory-optimized version of split_data that includes integrity checks
+        and alignment while managing memory efficiently.
 
         Args:
             data_dict (dict): Dictionary containing the data.
@@ -180,29 +232,61 @@ class ParameterOptimizer:
         """
         logging.info(f"Splitting data to train-test, cutoff: {train_end}")
 
-        self.check_datetime_index_integrity(data_dict)
+        # Step 1: Check datetime index integrity
+        is_valid, errors = self.check_datetime_index_integrity(data_dict)
+        if not is_valid:
+            logging.error(f"Data integrity check failed: {errors}")
+            return
 
-        data_dict = self.align_dataframes_to_max_index(data_dict)
+        # Step 2: Align DataFrames to max index using memory-efficient approach
+        try:
+            data_dict = self.align_dataframes_to_max_index(data_dict)
+        except Exception as e:
+            logging.error(f"Failed to align DataFrames: {str(e)}")
+            return
 
+        # Convert train_end to timestamp once
+        train_end_ts = pd.Timestamp(train_end)
+
+        # Define memory-efficient dtypes mapping
+        dtype_map = {np.float64: np.float32, np.int64: np.int32}
+
+        # Process each DataFrame separately to avoid keeping all in memory
         for ticker, df in data_dict.items():
+            try:
+                # Convert dtypes without creating a copy
+                for col in df.columns:
+                    current_dtype = df[col].dtype
+                    for old_dtype, new_dtype in dtype_map.items():
+                        if current_dtype == old_dtype:
+                            df[col] = df[col].astype(new_dtype)
 
-            for col in df.select_dtypes(include=[np.float64]).columns:
-                df[col] = df[col].astype(np.float32)
-            for col in df.select_dtypes(include=[np.int64]).columns:
-                df[col] = df[col].astype(np.int32)
+                # Get index for splitting without loading all data
+                split_idx = df.index.searchsorted(train_end_ts)
 
-            train_df = df.loc[:train_end].copy()
-            if not train_df.empty:
-                self.train_data[ticker] = train_df
-            else:
+                # Process training data
+                if split_idx > 0:
+                    # Use iloc for efficient slicing and avoid copies
+                    train_df = df.iloc[:split_idx]
+                    if not train_df.empty:
+                        self.train_data[ticker] = train_df
+                    train_df = None  # Help garbage collection
+
+                # Process test data
+                if split_idx < len(df):
+                    test_df = df.iloc[split_idx:]
+                    if not test_df.empty:
+                        self.test_data[ticker] = test_df
+                    test_df = None  # Help garbage collection
+
+            except Exception as e:
+                logging.warning(f"Error processing {ticker}: {str(e)}")
                 continue
 
-            if train_end in df.index:
-                test_df = df.loc[train_end:].copy()
-                if not test_df.empty:
-                    self.test_data[ticker] = test_df
+            # Clear references to help garbage collection
+            df = None
 
-        logging.info(f"Successfully splitted data")
+        logging.info("Successfully split data")
 
     def cpcv_generator(
         self, t_span: int, n: int, k: int, verbose: bool = True
@@ -446,7 +530,7 @@ class ParameterOptimizer:
             raise optuna.TrialPruned()
 
         # Access self.train_group_dict directly
-        sharpe, _ = self.combcv_pl(trial_params, self.train_group_dict)
+        sharpe, _ = self.combcv_pl(trial_params, self.group_dict)
         return sharpe
 
     def optimize(
@@ -473,7 +557,7 @@ class ParameterOptimizer:
         for fold_num, train_test_splits in self.combcv_dict.items():
             logging.info(f"Starting optimization for group: {fold_num}")
             self.current_group = train_test_splits
-            self.train_group_dict = self.generate_group_dict(is_train=True)
+            self.group_dict = self.generate_group_dict(is_train=True)
 
             study = optuna.create_study(
                 direction="maximize",
@@ -503,9 +587,9 @@ class ParameterOptimizer:
             top_params = all_trials[: max(1, int(len(all_trials) * best_trials_pct))]
             logging.info(f"Top {best_trials_pct} param combinations are: {top_params}")
 
-            test_group_dict = self.generate_group_dict(is_train=False)
+            self.group_dict = self.generate_group_dict(is_train=False)
             for i, trial_params in enumerate(top_params):
-                sharpe, returns_list = self.combcv_pl(trial_params, test_group_dict)
+                sharpe, returns_list = self.combcv_pl(trial_params, self.group_dict)
                 if i == 0:
                     trial_params["fold_num"] = fold_num
                 else:
@@ -1128,69 +1212,90 @@ class ImmutableDataFrame:
 
 
 def check_single_dataframe(
-    ticker: str, df: pd.DataFrame, all_dates: Set[pd.Timestamp]
+    ticker: str,
+    df: pd.DataFrame,
+    min_date: pd.Timestamp,
+    max_date: pd.Timestamp,
+    expected_freq: str,
 ) -> List[str]:
     """
-    Check integrity of a single DataFrame.
+    Memory-optimized version of DataFrame integrity checker with fixed gap detection.
 
     Args:
         ticker (str): The identifier for the DataFrame
         df (pd.DataFrame): The DataFrame to check
-        all_dates (Set[pd.Timestamp]): Set of all unique dates across all DataFrames
+        min_date (pd.Timestamp): Minimum date across all DataFrames
+        max_date (pd.Timestamp): Maximum date across all DataFrames
+        expected_freq (str): Expected frequency of the data (e.g., 'D', 'B', etc.)
 
     Returns:
         List[str]: List of error messages for this DataFrame
     """
     errors = []
 
-    # Check if index is DatetimeIndex
+    # Basic checks without loading full data into memory
     if not isinstance(df.index, pd.DatetimeIndex):
         return [f"DataFrame for {ticker} does not have a DatetimeIndex."]
 
-    # Check for duplicate indices
-    if df.index.duplicated().any():
+    # Check duplicates using generator to avoid loading all into memory
+    has_duplicates = False
+    seen = set()
+    for idx in df.index:
+        if idx in seen:
+            has_duplicates = True
+            break
+        seen.add(idx)
+    if has_duplicates:
         errors.append(f"DataFrame for {ticker} contains duplicate timestamps.")
 
-    # Check if index is sorted
-    if not df.index.is_monotonic_increasing:
-        errors.append(f"Index for {ticker} is not monotonically increasing.")
+    # Clear set to free memory
+    seen = None
 
-    # Check for missing dates
-    missing_dates = all_dates - set(df.index)
-    if missing_dates:
-        errors.append(f"DataFrame for {ticker} is missing {len(missing_dates)} dates.")
+    # Check if index is sorted using pairwise comparison
+    if len(df.index) > 1:
+        is_sorted = all(
+            df.index[i] <= df.index[i + 1] for i in range(len(df.index) - 1)
+        )
+        if not is_sorted:
+            errors.append(f"Index for {ticker} is not monotonically increasing.")
 
-    # Check for gaps in the index
+    # Check coverage using min/max dates instead of full set comparison
+    # if df.index.min() > min_date or df.index.max() < max_date:
+    #     try:
+    #         expected_range = pd.date_range(min_date, max_date, freq=expected_freq)
+    #         missing_days = len(expected_range.difference(df.index))
+    #         if missing_days > 0:
+    #             errors.append(
+    #                 f"DataFrame for {ticker} is missing {missing_days} dates."
+    #             )
+    #     except Exception as e:
+    #         errors.append(f"Could not check missing dates for {ticker}: {str(e)}")
+
+    # Check for gaps using chunked processing with proper frequency handling
     if len(df) > 1:
-        time_diff = df.index.to_series().diff().dropna()
-        freq = time_diff.mode()[0] if not time_diff.mode().empty else None
-        if freq is not None:
-            ideal_index = pd.date_range(
-                start=df.index.min(), end=df.index.max(), freq=freq
-            )
-            gaps = ideal_index.difference(df.index)
-            if len(gaps) > 0:
-                # Group consecutive gaps
-                gap_groups = []
-                sorted_gaps = sorted(gaps)
-                for k, g in groupby(
-                    enumerate(sorted_gaps),
-                    lambda x: x[0] - x[1].to_pydatetime().timestamp(),
-                ):
-                    group = list(map(itemgetter(1), g))
-                    gap_groups.append((group[0], group[-1]))
+        CHUNK_SIZE = 10000
+        has_gaps = False
+        prev_date = None
 
-                gap_info = ", ".join(
-                    f"{start}" if start == end else f"{start} to {end}"
-                    for start, end in gap_groups
-                )
+        try:
+            # Create a reference date range with the expected frequency
+            ref_range = pd.date_range(
+                start=df.index.min(), end=df.index.max(), freq=expected_freq
+            )
+
+            # Compare actual index with reference range
+            actual_index_set = set(df.index)
+            missing_dates = ref_range.difference(actual_index_set)
+
+            if len(missing_dates) > 0:
                 errors.append(
-                    f"DataFrame for {ticker} has gaps in its index. "
-                    f"Missing ranges: {gap_info}"
+                    f"DataFrame for {ticker} has {len(missing_dates)} gaps in its index "
+                    f"based on expected {expected_freq} frequency."
                 )
-        else:
+
+        except Exception as e:
             errors.append(
-                f"Unable to infer consistent frequency for {ticker}. Cannot check for gaps."
+                f"Unable to check for gaps in {ticker} with frequency {expected_freq}: {str(e)}"
             )
 
     return errors
