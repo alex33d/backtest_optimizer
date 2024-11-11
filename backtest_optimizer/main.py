@@ -33,6 +33,7 @@ import itertools as itt
 import threading
 from itertools import groupby
 from operator import itemgetter
+import gc
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
@@ -248,43 +249,35 @@ class ParameterOptimizer:
         # Convert train_end to timestamp once
         train_end_ts = pd.Timestamp(train_end)
 
-        # Define memory-efficient dtypes mapping
-        dtype_map = {np.float64: np.float32, np.int64: np.int32}
-
         # Process each DataFrame separately to avoid keeping all in memory
         for ticker, df in data_dict.items():
             try:
-                # Convert dtypes without creating a copy
-                for col in df.columns:
-                    current_dtype = df[col].dtype
-                    for old_dtype, new_dtype in dtype_map.items():
-                        if current_dtype == old_dtype:
-                            df[col] = df[col].astype(new_dtype)
+                # Downcast numerical columns
+                df = df.apply(pd.to_numeric, downcast="float")
+                df = df.apply(pd.to_numeric, downcast="integer")
 
-                # Get index for splitting without loading all data
+                # Ensure the index is sorted
+                df = df.sort_index()
+
                 split_idx = df.index.searchsorted(train_end_ts)
 
-                # Process training data
                 if split_idx > 0:
-                    # Use iloc for efficient slicing and avoid copies
                     train_df = df.iloc[:split_idx]
                     if not train_df.empty:
                         self.train_data[ticker] = train_df
-                    train_df = None  # Help garbage collection
 
-                # Process test data
                 if split_idx < len(df):
                     test_df = df.iloc[split_idx:]
                     if not test_df.empty:
                         self.test_data[ticker] = test_df
-                    test_df = None  # Help garbage collection
+
+                # Optionally delete processed DataFrames
+                del df, train_df, test_df
+                gc.collect()
 
             except Exception as e:
                 logging.warning(f"Error processing {ticker}: {str(e)}")
                 continue
-
-            # Clear references to help garbage collection
-            df = None
 
         logging.info("Successfully split data")
 
@@ -1214,88 +1207,27 @@ class ImmutableDataFrame:
 def check_single_dataframe(
     ticker: str,
     df: pd.DataFrame,
-    min_date: pd.Timestamp,
-    max_date: pd.Timestamp,
     expected_freq: str,
 ) -> List[str]:
-    """
-    Memory-optimized version of DataFrame integrity checker with fixed gap detection.
-
-    Args:
-        ticker (str): The identifier for the DataFrame
-        df (pd.DataFrame): The DataFrame to check
-        min_date (pd.Timestamp): Minimum date across all DataFrames
-        max_date (pd.Timestamp): Maximum date across all DataFrames
-        expected_freq (str): Expected frequency of the data (e.g., 'D', 'B', etc.)
-
-    Returns:
-        List[str]: List of error messages for this DataFrame
-    """
     errors = []
 
-    # Basic checks without loading full data into memory
     if not isinstance(df.index, pd.DatetimeIndex):
         return [f"DataFrame for {ticker} does not have a DatetimeIndex."]
 
-    # Check duplicates using generator to avoid loading all into memory
-    has_duplicates = False
-    seen = set()
-    for idx in df.index:
-        if idx in seen:
-            has_duplicates = True
-            break
-        seen.add(idx)
-    if has_duplicates:
+    if df.index.has_duplicates:
         errors.append(f"DataFrame for {ticker} contains duplicate timestamps.")
 
-    # Clear set to free memory
-    seen = None
+    if not df.index.is_monotonic_increasing:
+        errors.append(f"Index for {ticker} is not monotonically increasing.")
 
-    # Check if index is sorted using pairwise comparison
-    if len(df.index) > 1:
-        is_sorted = all(
-            df.index[i] <= df.index[i + 1] for i in range(len(df.index) - 1)
-        )
-        if not is_sorted:
-            errors.append(f"Index for {ticker} is not monotonically increasing.")
-
-    # Check coverage using min/max dates instead of full set comparison
-    # if df.index.min() > min_date or df.index.max() < max_date:
-    #     try:
-    #         expected_range = pd.date_range(min_date, max_date, freq=expected_freq)
-    #         missing_days = len(expected_range.difference(df.index))
-    #         if missing_days > 0:
-    #             errors.append(
-    #                 f"DataFrame for {ticker} is missing {missing_days} dates."
-    #             )
-    #     except Exception as e:
-    #         errors.append(f"Could not check missing dates for {ticker}: {str(e)}")
-
-    # Check for gaps using chunked processing with proper frequency handling
     if len(df) > 1:
-        CHUNK_SIZE = 10000
-        has_gaps = False
-        prev_date = None
-
-        try:
-            # Create a reference date range with the expected frequency
-            ref_range = pd.date_range(
-                start=df.index.min(), end=df.index.max(), freq=expected_freq
-            )
-
-            # Compare actual index with reference range
-            actual_index_set = set(df.index)
-            missing_dates = ref_range.difference(actual_index_set)
-
-            if len(missing_dates) > 0:
-                errors.append(
-                    f"DataFrame for {ticker} has {len(missing_dates)} gaps in its index "
-                    f"based on expected {expected_freq} frequency."
-                )
-
-        except Exception as e:
+        expected_timedelta = pd.Timedelta(
+            pd.tseries.frequencies.to_offset(expected_freq)
+        )
+        gaps = df.index.to_series().diff() > expected_timedelta
+        if gaps.any():
             errors.append(
-                f"Unable to check for gaps in {ticker} with frequency {expected_freq}: {str(e)}"
+                f"DataFrame for {ticker} has gaps in its index based on expected {expected_freq} frequency."
             )
 
     return errors
