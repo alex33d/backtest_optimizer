@@ -35,6 +35,8 @@ from itertools import groupby
 from operator import itemgetter
 import gc
 import dask.dataframe as dd
+from dask import delayed, compute
+import dask
 from collections import Counter
 
 from metrics import *
@@ -384,7 +386,7 @@ class ParameterOptimizer:
         self, data_type: str, use_dask: bool = False, tickers: list = None
     ):
         """
-        Load data from Parquet files into self.data or self.test_data.
+        Load data from Parquet files into self.data or self.test_data with improved performance.
 
         Args:
             data_type (str): Specify 'train' or 'test' to load the corresponding data.
@@ -395,6 +397,7 @@ class ParameterOptimizer:
             ValueError: If data_type is not 'train' or 'test'.
             FileNotFoundError: If the specified Parquet file does not exist.
         """
+
         if data_type not in ("train", "test"):
             raise ValueError("data_type must be 'train' or 'test'")
 
@@ -406,39 +409,77 @@ class ParameterOptimizer:
         logging.info(f"Loading {data_type} data from {file_path}")
 
         if use_dask:
+            # Configure Dask for better performance
+            dask.config.set(
+                {
+                    "dataframe.shuffle.method": "tasks",
+                    "distributed.worker.memory.target": 0.6,  # Target 60% memory usage
+                    "distributed.worker.memory.spill": 0.7,  # Spill to disk at 70%
+                    "distributed.worker.memory.pause": 0.8,  # Pause execution at 80%
+                }
+            )
 
+            # Use optimized Dask reading
             if tickers:
-                filters = [("ticker", "in", tickers)]
-                data_df = dd.read_parquet(file_path, filters=filters)
-            else:
-                data_df = dd.read_parquet(file_path)
-
-            # Process the DataFrame into a dictionary of pandas DataFrames per ticker
-            if tickers:
+                # Read only necessary columns and filter by tickers
+                data_df = dd.read_parquet(
+                    file_path,
+                    filters=[("ticker", "in", tickers)],
+                    engine="pyarrow",  # Usually faster than fastparquet for reading
+                )
                 unique_tickers = tickers
             else:
+                data_df = dd.read_parquet(file_path, engine="pyarrow")
+                # Efficiently get unique tickers
                 unique_tickers = data_df["ticker"].unique().compute()
 
             data_dict = {}
-            # Add tqdm progress bar here
-            for ticker in tqdm(unique_tickers, desc="Processing tickers"):
-                ticker_df = data_df[data_df["ticker"] == ticker].drop("ticker", axis=1)
-                # Convert to pandas DataFrame
-                ticker_df = ticker_df.compute()
-                data_dict[ticker] = ticker_df
-        else:
-            # Use pandas with fastparquet engine
-            data_df = pd.read_parquet(file_path, engine="fastparquet")
-            if tickers:
-                data_df = data_df[data_df["ticker"].isin(tickers)]
 
-            # Process the DataFrame into a dictionary of pandas DataFrames per ticker
+            # Prepare delayed computations for each ticker
+            delayed_tasks = []
+            for ticker in unique_tickers:
+
+                @delayed
+                def get_ticker_data(ticker=ticker):
+                    ticker_df = data_df[data_df["ticker"] == ticker].drop(
+                        "ticker", axis=1
+                    )
+                    # Convert to pandas DataFrame
+                    ticker_df = ticker_df.compute()
+                    return ticker, ticker_df
+
+                delayed_tasks.append(get_ticker_data())
+
+            # Compute all tasks in parallel with progress bar
+            with tqdm(total=len(delayed_tasks), desc="Processing tickers") as pbar:
+                for result in compute(*delayed_tasks):
+                    ticker, ticker_df = result
+                    data_dict[ticker] = ticker_df
+                    pbar.update(1)
+
+        else:
+            # Optimized pandas reading
+            if tickers:
+                # Use pyarrow with predicate pushdown
+                data_df = pd.read_parquet(
+                    file_path,
+                    engine="pyarrow",
+                    filters=[("ticker", "in", tickers)],
+                )
+                unique_tickers = tickers
+            else:
+                data_df = pd.read_parquet(
+                    file_path,
+                    engine="pyarrow",
+                )
+                unique_tickers = data_df["ticker"].unique()
+
+            # Use more efficient groupby operation with progress bar
             data_dict = {}
-            # Add tqdm progress bar here
-            for ticker, df in tqdm(
-                data_df.groupby("ticker"), desc="Processing tickers"
-            ):
-                data_dict[ticker] = df.drop("ticker", axis=1)
+            grouped = data_df.groupby("ticker", observed=True)
+            for ticker in tqdm(unique_tickers, desc="Processing tickers"):
+                group = grouped.get_group(ticker)
+                data_dict[ticker] = group.drop("ticker", axis=1)
 
         self.data = data_dict
         logging.info(f"{data_type.capitalize()} data loaded successfully")
