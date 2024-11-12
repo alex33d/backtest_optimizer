@@ -34,6 +34,8 @@ import threading
 from itertools import groupby
 from operator import itemgetter
 import gc
+import dask.dataframe as dd
+from collections import Counter
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
@@ -95,9 +97,8 @@ class ParameterOptimizer:
         self.backtest_paths = {}
         self.top_params_list = None
         self.current_group = None
-        self.group_dict = None
-        self.train_data = {}
-        self.test_data = {}
+        self.group_indices = None
+        self.data = {}
         self.save_path = save_path
         self.file_prefix = save_file_prefix
         self.n_jobs = n_jobs
@@ -107,7 +108,7 @@ class ParameterOptimizer:
     ) -> Tuple[bool, List[str]]:
         """
         Memory-optimized version of datetime index integrity checker.
-        Uses streaming operations and minimal memory footprint.
+        Uses sequential processing and minimal memory footprint.
 
         Args:
             data_dict (Dict[str, pd.DataFrame]): Dictionary of DataFrames with datetime indices.
@@ -121,25 +122,16 @@ class ParameterOptimizer:
             error_messages.append("The input dictionary is empty.")
             return False, error_messages
 
-        # Find min/max dates and infer frequency using generator expressions
-        min_date = None
-        max_date = None
         frequencies = []
+        expected_freq = None
 
-        for df in data_dict.values():
+        for ticker, df in data_dict.items():
             if not isinstance(df.index, pd.DatetimeIndex):
                 continue
-
-            curr_min = df.index.min()
-            curr_max = df.index.max()
-
-            min_date = curr_min if min_date is None else min(min_date, curr_min)
-            max_date = curr_max if max_date is None else max(max_date, curr_max)
 
             # Infer frequency from first few rows to save memory
             if len(df) > 1:
                 try:
-                    # Try to infer frequency from a larger sample for better accuracy
                     sample_size = min(len(df), 1000)
                     sample = df.index[:sample_size]
                     freq = pd.infer_freq(sample)
@@ -148,57 +140,24 @@ class ParameterOptimizer:
                 except Exception:
                     continue
 
-        if min_date is None or max_date is None:
-            error_messages.append("No valid DatetimeIndex found in any DataFrame.")
-            return False, error_messages
-
-        # Find most common frequency using Counter
-        from collections import Counter
-
+        # Determine expected frequency
         if frequencies:
+            from collections import Counter
+
             freq_counter = Counter(frequencies)
             expected_freq = freq_counter.most_common(1)[0][0]
         else:
-            # Try to infer frequency from the first valid DataFrame
-            for df in data_dict.values():
-                if isinstance(df.index, pd.DatetimeIndex) and len(df) > 1:
-                    try:
-                        expected_freq = pd.infer_freq(df.index)
-                        if expected_freq:
-                            break
-                    except Exception:
-                        continue
-            else:
-                expected_freq = "B"  # Default to business day if nothing else works
+            # Default to 'B' if unable to infer
+            expected_freq = "B"
 
-        # Process DataFrames in parallel with optimized arguments
-        check_func = partial(
-            check_single_dataframe,
-            expected_freq=expected_freq,
-        )
+        # Process DataFrames sequentially to conserve memory
+        all_errors = []
 
-        # Process in smaller batches to manage memory
-        BATCH_SIZE = 10
-        all_results = []
+        for ticker, df in data_dict.items():
+            errors = self.check_single_dataframe(ticker, df)
+            all_errors.extend(errors)
 
-        items = list(data_dict.items())
-        for i in range(0, len(items), BATCH_SIZE):
-            batch_items = items[i : i + BATCH_SIZE]
-            try:
-                with Pool(processes=min(len(batch_items), self.n_jobs)) as pool:
-                    batch_results = pool.starmap(check_func, batch_items)
-                    all_results.extend(batch_results)
-            except Exception as e:
-                error_messages.append(f"Error processing batch: {str(e)}")
-                continue
-            finally:
-                # Clear batch data
-                batch_items = None
-
-        # Collect all error messages
-        error_messages.extend([error for sublist in all_results for error in sublist])
-
-        return len(error_messages) == 0, error_messages
+        return len(all_errors) == 0, all_errors
 
     def align_dataframes_to_max_index(self, data_dict: dict):
         # Find the maximum date range
@@ -222,19 +181,50 @@ class ParameterOptimizer:
 
     def split_data(self, data_dict: dict, train_end: str):
         """
-        Memory-optimized version of split_data that includes integrity checks
+        Memory-optimized version of split_data using Dask that includes integrity checks
         and alignment while managing memory efficiently.
 
         Args:
             data_dict (dict): Dictionary containing the data.
             train_end (str): The end date for the training data.
         """
-        logging.info(f"Splitting data to train-test, cutoff: {train_end}")
+        logging.info(
+            f"Splitting data into train and test sets with cutoff: {train_end}"
+        )
 
-        # Step 1: Check datetime index integrity
-        is_valid, errors = self.check_datetime_index_integrity(data_dict)
-        if not is_valid:
-            logging.error(f"Data integrity check failed: {errors}")
+        # Step 1: Check datetime index integrity and infer expected frequency
+        error_messages = []
+        frequencies = []
+
+        for ticker, df in data_dict.items():
+            try:
+                # Ensure index is a DatetimeIndex
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+
+                # Perform index integrity checks
+                errors = self.check_single_dataframe(ticker, df)
+                if errors:
+                    error_messages.extend(errors)
+                    continue  # Skip this DataFrame if errors are found
+
+                # Infer frequency for alignment
+                if len(df) > 1:
+                    try:
+                        sample_size = min(len(df), 1000)
+                        sample = df.index[:sample_size]
+                        freq = pd.infer_freq(sample)
+                        if freq:
+                            frequencies.append(freq)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.warning(f"Error processing {ticker}: {str(e)}")
+                continue
+
+        # If any errors were found during index checks, log them and exit
+        if error_messages:
+            logging.error(f"Data integrity check failed: {error_messages}")
             return
 
         # Step 2: Align DataFrames to max index using memory-efficient approach
@@ -244,40 +234,66 @@ class ParameterOptimizer:
             logging.error(f"Failed to align DataFrames: {str(e)}")
             return
 
-        # Convert train_end to timestamp once
+        # Convert train_end to a Timestamp once
         train_end_ts = pd.Timestamp(train_end)
 
-        # Process each DataFrame separately to avoid keeping all in memory
+        # Lists to store Dask DataFrames
+        dask_dfs = []
+
+        # Process each DataFrame individually
         for ticker, df in data_dict.items():
+
+            if df.empty:
+                continue
             try:
-                # Downcast numerical columns
-                df = df.apply(pd.to_numeric, downcast="float")
-                df = df.apply(pd.to_numeric, downcast="integer")
+                # Add 'ticker' column to identify data after concatenation
+                df["ticker"] = ticker
 
-                # Ensure the index is sorted
-                df = df.sort_index()
+                # Downcast numerical columns to save memory
+                numerical_cols = df.select_dtypes(include=["float64", "int64"]).columns
+                for col in numerical_cols:
+                    if df[col].dtype == "float64":
+                        df[col] = df[col].astype("float32")
+                    elif df[col].dtype == "int64":
+                        df[col] = df[col].astype("int32")
 
-                split_idx = df.index.searchsorted(train_end_ts)
+                # Convert to Dask DataFrame
+                dask_df = dd.from_pandas(df, npartitions=10)
+                dask_dfs.append(dask_df)
 
-                if split_idx > 0:
-                    train_df = df.iloc[:split_idx]
-                    if not train_df.empty:
-                        self.train_data[ticker] = train_df
-
-                if split_idx < len(df):
-                    test_df = df.iloc[split_idx:]
-                    if not test_df.empty:
-                        self.test_data[ticker] = test_df
-
-                # Optionally delete processed DataFrames
-                del df, train_df, test_df
+                # Clean up to free memory
+                del df
                 gc.collect()
-
             except Exception as e:
                 logging.warning(f"Error processing {ticker}: {str(e)}")
                 continue
 
-        logging.info("Successfully split data")
+        # Concatenate all Dask DataFrames into one
+        combined_df = dd.concat(dask_dfs)
+
+        # Clean up the list of individual Dask DataFrames
+        del dask_dfs
+        gc.collect()
+
+        # Ensure the index is sorted
+        combined_df = combined_df.map_partitions(lambda df: df.sort_index())
+
+        # Split the data into training and testing sets based on the cutoff date
+        train_df = combined_df.loc[combined_df.index < train_end_ts]
+        test_df = combined_df.loc[combined_df.index >= train_end_ts]
+
+        # Save the training and testing sets to disk in Parquet format
+        for data_type, df in ({"train": train_df, "test": test_df}).items():
+            file_path = os.path.join(self.save_path, f"{data_type}_data.parquet")
+            df.to_parquet(file_path, write_index=True)
+
+        # Clean up to free memory
+        del combined_df, train_df, test_df
+        gc.collect()
+
+        logging.info(
+            f"Successfully split data into training and testing sets and saved to {self.save_path}"
+        )
 
     def cpcv_generator(
         self, t_span: int, n: int, k: int, verbose: bool = True
@@ -340,7 +356,7 @@ class ParameterOptimizer:
     def generate_group_dict(self, is_train: bool) -> dict:
 
         group_dict = {}
-        for ticker, df in self.train_data.items():
+        for ticker, df in self.data.items():
             if ticker not in self.current_group:
                 continue
             select_idx = self.current_group[ticker]["train"]
@@ -362,19 +378,106 @@ class ParameterOptimizer:
             group_dict[i] = data_dict
         return group_dict
 
-    def combcv_pl(self, params: dict, group_dict: dict) -> tuple:
+    def load_data_from_parquet(
+        self, data_type: str, use_dask: bool = False, tickers: list = None
+    ):
+        """
+        Load data from Parquet files into self.data or self.test_data.
+
+        Args:
+            data_type (str): Specify 'train' or 'test' to load the corresponding data.
+            use_dask (bool): Whether to use Dask DataFrames. Set to False to use pandas.
+            tickers (list): List of tickers to load. If None, load all tickers.
+
+        Raises:
+            ValueError: If data_type is not 'train' or 'test'.
+            FileNotFoundError: If the specified Parquet file does not exist.
+        """
+        if data_type not in ("train", "test"):
+            raise ValueError("data_type must be 'train' or 'test'")
+
+        file_path = os.path.join(self.save_path, f"{data_type}_data.parquet")
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"{file_path} does not exist.")
+
+        logging.info(f"Loading {data_type} data from {file_path}")
+
+        if use_dask:
+            # Use Dask DataFrame for large datasets
+            if tickers:
+                # Use filters to read only specific tickers
+                filters = [("ticker", "in", tickers)]
+                data_df = dd.read_parquet(file_path, filters=filters)
+            else:
+                data_df = dd.read_parquet(file_path)
+        else:
+            # Use pandas DataFrame for smaller datasets
+            data_df = pd.read_parquet(file_path)
+            if tickers:
+                data_df = data_df[data_df["ticker"].isin(tickers)]
+
+        # Process the DataFrame into a dictionary of DataFrames per ticker
+        if use_dask:
+            # Convert Dask DataFrame to a dictionary of Dask DataFrames per ticker
+            if tickers:
+                unique_tickers = tickers
+            else:
+                unique_tickers = data_df["ticker"].unique().compute()
+            data_dict = {}
+            for ticker in unique_tickers:
+                ticker_df = data_df[data_df["ticker"] == ticker].drop("ticker", axis=1)
+                data_dict[ticker] = ticker_df
+        else:
+            # Convert pandas DataFrame to a dictionary of pandas DataFrames per ticker
+            data_dict = {
+                ticker: df.drop("ticker", axis=1)
+                for ticker, df in data_df.groupby("ticker")
+            }
+
+        self.data = data_dict
+        logging.info(f"{data_type.capitalize()} data loaded successfully")
+
+    def generate_group_indices(self, is_train: bool):
+        """
+        Generate group indices for training or testing.
+
+        Args:
+            is_train (bool): Whether to generate indices for training or testing.
+
+        Returns:
+            dict: A dictionary mapping group numbers to indices.
+        """
+        group_indices = {}
+        for ticker, df in self.data.items():
+            if ticker not in self.current_group:
+                continue
+            select_idx = self.current_group[ticker]["train"]
+            if self.current_group[ticker]["test"] and not is_train:
+                select_idx = self.current_group[ticker]["test"]
+            for i, idx in enumerate(select_idx):
+                if i not in group_indices:
+                    group_indices[i] = {}
+                group_indices[i][ticker] = idx  # Store indices instead of DataFrames
+        return group_indices
+
+    def combcv_pl(self, params: dict, group_indices: dict) -> tuple:
         """
         Calculate performance metrics using combinatorial cross-validation.
 
         Args:
             params (dict): Parameters for the performance calculation.
-            is_train (bool): Whether the data is for training or testing.
+            group_indices (dict): Dictionary of indices for each group.
 
         Returns:
             tuple: (final_sharpe, final_returns) calculated metrics.
         """
         final_returns = []
-        for group_num, group_data in group_dict.items():
+        for group_num, ticker_indices in group_indices.items():
+            group_data = {}
+            for ticker, indices in ticker_indices.items():
+                df = self.data[ticker].iloc[indices]
+                group_data[ticker] = df
             returns = self.calc_pl(group_data, params)
             final_returns.append(returns)
 
@@ -464,7 +567,7 @@ class ParameterOptimizer:
                 "Using the entire dataset as the training set with no validation groups."
             )
             self.combcv_dict[0] = {}
-            for ticker, df in self.train_data.items():
+            for ticker, df in self.data.items():
                 self.combcv_dict[0][ticker] = {
                     "train": [np.arange(len(df))],
                     "test": None,
@@ -473,7 +576,7 @@ class ParameterOptimizer:
             logging.info(
                 f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
             )
-            for ticker, df in self.train_data.items():
+            for ticker, df in self.data.items():
 
                 if len(df) > total_comb * 50:
                     data_length = len(df)
@@ -521,7 +624,7 @@ class ParameterOptimizer:
             raise optuna.TrialPruned()
 
         # Access self.train_group_dict directly
-        sharpe, _ = self.combcv_pl(trial_params, self.group_dict)
+        sharpe, _ = self.combcv_pl(trial_params, self.group_indices)
         return sharpe
 
     def optimize(
@@ -548,7 +651,7 @@ class ParameterOptimizer:
         for fold_num, train_test_splits in self.combcv_dict.items():
             logging.info(f"Starting optimization for group: {fold_num}")
             self.current_group = train_test_splits
-            self.group_dict = self.generate_group_dict(is_train=True)
+            self.group_indices = self.generate_group_indices(is_train=True)
 
             study = optuna.create_study(
                 direction="maximize",
@@ -578,9 +681,9 @@ class ParameterOptimizer:
             top_params = all_trials[: max(1, int(len(all_trials) * best_trials_pct))]
             logging.info(f"Top {best_trials_pct} param combinations are: {top_params}")
 
-            self.group_dict = self.generate_group_dict(is_train=False)
+            self.group_indices = self.generate_group_indices(is_train=False)
             for i, trial_params in enumerate(top_params):
-                sharpe, returns_list = self.combcv_pl(trial_params, self.group_dict)
+                sharpe, returns_list = self.combcv_pl(trial_params, self.group_indices)
                 if i == 0:
                     trial_params["fold_num"] = fold_num
                 else:
@@ -659,7 +762,7 @@ class ParameterOptimizer:
                 params = self.best_params_by_fold[fold]
                 for ticker, path_array in self.backtest_paths.items():
                     test_indices = np.where(path_array[:, path_num] == fold)[0]
-                    tmp_dict[ticker] = self.train_data[ticker].iloc[test_indices]
+                    tmp_dict[ticker] = self.data[ticker].iloc[test_indices]
                 returns = self.calc_pl(tmp_dict, params)
                 path_returns.append(returns)
 
@@ -702,7 +805,7 @@ class ParameterOptimizer:
         logging.info(f"Running stress tests, num_workers: {num_workers}")
 
         # Create local references to necessary data
-        shared_train_data = self.train_data.copy()
+        shared_train_data = self.data.copy()
         all_tested_params = self.all_tested_params.copy()
         calc_pl = self.calc_pl  # Local reference to avoid pickling self
 
@@ -1070,6 +1173,55 @@ class ParameterOptimizer:
         plt.close()
         logging.info(f"Cumulative returns plot saved to {plot_path}")
 
+    def check_single_dataframe(self, ticker: str, df: pd.DataFrame) -> List[str]:
+        """
+        Checks the integrity of a single DataFrame's datetime index.
+
+        Args:
+            ticker (str): The identifier for the DataFrame.
+            df (pd.DataFrame): The DataFrame to check.
+
+        Returns:
+            List[str]: List of error messages for this DataFrame.
+        """
+        errors = []
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            errors.append(f"DataFrame for {ticker} does not have a DatetimeIndex.")
+            return errors
+
+        if df.index.has_duplicates:
+            errors.append(f"DataFrame for {ticker} contains duplicate timestamps.")
+
+        if not df.index.is_monotonic_increasing:
+            errors.append(f"Index for {ticker} is not monotonically increasing.")
+
+        if len(df) > 1:
+            # Attempt to infer frequency
+            freq = None
+            try:
+                freq = pd.infer_freq(df.index)
+                if not freq:
+                    errors.append(f"Could not infer frequency for {ticker}.")
+            except Exception as e:
+                errors.append(f"Could not infer frequency for {ticker}: {str(e)}")
+
+            # Check for gaps in the index based on the inferred frequency
+            expected_freq = (
+                freq if freq else "B"
+            )  # Use inferred frequency or default to 'B'
+            expected_timedelta = pd.Timedelta(
+                pd.tseries.frequencies.to_offset(expected_freq)
+            )
+            diffs = df.index.to_series().diff().dropna()
+            gaps = diffs > expected_timedelta
+            if gaps.any():
+                errors.append(
+                    f"DataFrame for {ticker} has gaps in its index based on expected {expected_freq} frequency."
+                )
+
+        return errors
+
 
 def process_combination(
     combination: Tuple[Any, ...],
@@ -1200,32 +1352,3 @@ class ImmutableDataFrame:
         df_copy = self._df.copy(deep=False)  # Create a shallow copy
         df_copy.values.flags.writeable = True  # Allow modifications
         return df_copy
-
-
-def check_single_dataframe(
-    ticker: str,
-    df: pd.DataFrame,
-    expected_freq: str,
-) -> List[str]:
-    errors = []
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        return [f"DataFrame for {ticker} does not have a DatetimeIndex."]
-
-    if df.index.has_duplicates:
-        errors.append(f"DataFrame for {ticker} contains duplicate timestamps.")
-
-    if not df.index.is_monotonic_increasing:
-        errors.append(f"Index for {ticker} is not monotonically increasing.")
-
-    if len(df) > 1:
-        expected_timedelta = pd.Timedelta(
-            pd.tseries.frequencies.to_offset(expected_freq)
-        )
-        gaps = df.index.to_series().diff() > expected_timedelta
-        if gaps.any():
-            errors.append(
-                f"DataFrame for {ticker} has gaps in its index based on expected {expected_freq} frequency."
-            )
-
-    return errors
