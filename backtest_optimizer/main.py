@@ -382,7 +382,7 @@ class ParameterOptimizer:
         self, data_type: str, use_dask: bool = False, tickers: list = None
     ):
         """
-        Load data from Parquet files into self.data or self.test_data.
+        Load data from Parquet files into self.data.
 
         Args:
             data_type (str): Specify 'train' or 'test' to load the corresponding data.
@@ -427,6 +427,7 @@ class ParameterOptimizer:
             data_dict = {}
             for ticker in unique_tickers:
                 ticker_df = data_df[data_df["ticker"] == ticker].drop("ticker", axis=1)
+                ticker_df = ticker_df.compute()
                 data_dict[ticker] = ticker_df
         else:
             # Convert pandas DataFrame to a dictionary of pandas DataFrames per ticker
