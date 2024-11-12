@@ -383,7 +383,11 @@ class ParameterOptimizer:
     from tqdm import tqdm
 
     def load_data_from_parquet(
-        self, data_type: str, use_dask: bool = False, tickers: list = None
+        self,
+        data_type: str,
+        use_dask: bool = False,
+        tickers: list = None,
+        engine="fastparquet",
     ):
         """
         Load data from Parquet files into self.data or self.test_data with improved performance.
@@ -463,14 +467,14 @@ class ParameterOptimizer:
                 # Use pyarrow with predicate pushdown
                 data_df = pd.read_parquet(
                     file_path,
-                    engine="pyarrow",
+                    engine=engine,
                     filters=[("ticker", "in", tickers)],
                 )
                 unique_tickers = tickers
             else:
                 data_df = pd.read_parquet(
                     file_path,
-                    engine="pyarrow",
+                    engine=engine,
                 )
                 unique_tickers = data_df["ticker"].unique()
 
