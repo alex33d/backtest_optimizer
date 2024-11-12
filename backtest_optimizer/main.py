@@ -239,59 +239,56 @@ class ParameterOptimizer:
         # Convert train_end to a Timestamp once
         train_end_ts = pd.Timestamp(train_end)
 
-        # Lists to store Dask DataFrames
-        dask_dfs = []
+        # Prepare directories to save individual ticker data
+        train_dir = os.path.join(self.save_path, "train_data")
+        test_dir = os.path.join(self.save_path, "test_data")
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
 
         # Process each DataFrame individually
-        for ticker, df in data_dict.items():
-
+        for ticker, df in tqdm(data_dict.items(), desc="Processing tickers"):
             if df.empty:
                 continue
             try:
-                # Add 'ticker' column to identify data after concatenation
-                df["ticker"] = ticker
+                # Ensure index is a DatetimeIndex
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+
+                # Sort the index to ensure chronological order
+                df.sort_index(inplace=True)
+
+                # Split the data into training and testing sets
+                train_df = df.loc[df.index < train_end_ts]
+                test_df = df.loc[df.index >= train_end_ts]
 
                 # Downcast numerical columns to save memory
-                numerical_cols = df.select_dtypes(include=["float64", "int64"]).columns
+                numerical_cols = train_df.select_dtypes(
+                    include=["float64", "int64"]
+                ).columns
                 for col in numerical_cols:
-                    if df[col].dtype == "float64":
-                        df[col] = df[col].astype("float32")
-                    elif df[col].dtype == "int64":
-                        df[col] = df[col].astype("int32")
+                    if train_df[col].dtype == "float64":
+                        train_df[col] = train_df[col].astype("float32")
+                        test_df[col] = test_df[col].astype("float32")
+                    elif train_df[col].dtype == "int64":
+                        train_df[col] = train_df[col].astype("int32")
+                        test_df[col] = test_df[col].astype("int32")
 
-                # Convert to Dask DataFrame
-                dask_df = dd.from_pandas(df, npartitions=10)
-                dask_dfs.append(dask_df)
+                self.data[ticker] = train_df
+
+                # Save the training and testing sets to disk in Parquet format
+                train_file_path = os.path.join(train_dir, f"{ticker}.parquet")
+                test_file_path = os.path.join(test_dir, f"{ticker}.parquet")
+
+                train_df.to_parquet(train_file_path, index=True)
+                test_df.to_parquet(test_file_path, index=True)
 
                 # Clean up to free memory
-                del df
+                del df, train_df, test_df
                 gc.collect()
+
             except Exception as e:
                 logging.warning(f"Error processing {ticker}: {str(e)}")
                 continue
-
-        # Concatenate all Dask DataFrames into one
-        combined_df = dd.concat(dask_dfs)
-
-        # Clean up the list of individual Dask DataFrames
-        del dask_dfs
-        gc.collect()
-
-        # Ensure the index is sorted
-        combined_df = combined_df.map_partitions(lambda df: df.sort_index())
-
-        # Split the data into training and testing sets based on the cutoff date
-        train_df = combined_df.loc[combined_df.index < train_end_ts]
-        test_df = combined_df.loc[combined_df.index >= train_end_ts]
-
-        # Save the training and testing sets to disk in Parquet format
-        for data_type, df in ({"train": train_df, "test": test_df}).items():
-            file_path = os.path.join(self.save_path, f"{data_type}_data.parquet")
-            df.to_parquet(file_path, write_index=True)
-
-        # Clean up to free memory
-        del combined_df, train_df, test_df
-        gc.collect()
 
         logging.info(
             f"Successfully split data into training and testing sets and saved to {self.save_path}"
@@ -382,108 +379,35 @@ class ParameterOptimizer:
 
     from tqdm import tqdm
 
-    def load_data_from_parquet(
-        self,
-        data_type: str,
-        use_dask: bool = False,
-        tickers: list = None,
-        engine="fastparquet",
-    ):
+    def load_data_from_parquet(self, data_type: str, tickers: list = None):
         """
-        Load data from Parquet files into self.data or self.test_data with improved performance.
+        Load data from individual Parquet files into self.data or self.test_data.
 
         Args:
             data_type (str): Specify 'train' or 'test' to load the corresponding data.
-            use_dask (bool): Whether to use Dask DataFrames. Set to False to use pandas.
             tickers (list): List of tickers to load. If None, load all tickers.
-
-        Raises:
-            ValueError: If data_type is not 'train' or 'test'.
-            FileNotFoundError: If the specified Parquet file does not exist.
         """
-
         if data_type not in ("train", "test"):
             raise ValueError("data_type must be 'train' or 'test'")
 
-        file_path = os.path.join(self.save_path, f"{data_type}_data.parquet")
+        dir_path = os.path.join(self.save_path, f"{data_type}_data")
 
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"{file_path} does not exist.")
+        if not os.path.exists(dir_path):
+            raise FileNotFoundError(f"{dir_path} does not exist.")
 
-        logging.info(f"Loading {data_type} data from {file_path}")
+        logging.info(f"Loading {data_type} data from {dir_path}")
 
-        if use_dask:
-            # Configure Dask for better performance
-            dask.config.set(
-                {
-                    "dataframe.shuffle.method": "tasks",
-                    "distributed.worker.memory.target": 0.6,  # Target 60% memory usage
-                    "distributed.worker.memory.spill": 0.7,  # Spill to disk at 70%
-                    "distributed.worker.memory.pause": 0.8,  # Pause execution at 80%
-                }
-            )
+        if tickers is None:
+            tickers = [f[:-8] for f in os.listdir(dir_path) if f.endswith(".parquet")]
 
-            # Use optimized Dask reading
-            if tickers:
-                # Read only necessary columns and filter by tickers
-                data_df = dd.read_parquet(
-                    file_path,
-                    filters=[("ticker", "in", tickers)],
-                    engine="pyarrow",  # Usually faster than fastparquet for reading
-                )
-                unique_tickers = tickers
+        data_dict = {}
+        for ticker in tqdm(tickers, desc="Loading tickers"):
+            file_path = os.path.join(dir_path, f"{ticker}.parquet")
+            if os.path.exists(file_path):
+                df = pd.read_parquet(file_path)
+                data_dict[ticker] = df
             else:
-                data_df = dd.read_parquet(file_path, engine="pyarrow")
-                # Efficiently get unique tickers
-                unique_tickers = data_df["ticker"].unique().compute()
-
-            data_dict = {}
-
-            # Prepare delayed computations for each ticker
-            delayed_tasks = []
-            for ticker in unique_tickers:
-
-                @delayed
-                def get_ticker_data(ticker=ticker):
-                    ticker_df = data_df[data_df["ticker"] == ticker].drop(
-                        "ticker", axis=1
-                    )
-                    # Convert to pandas DataFrame
-                    ticker_df = ticker_df.compute()
-                    return ticker, ticker_df
-
-                delayed_tasks.append(get_ticker_data())
-
-            # Compute all tasks in parallel with progress bar
-            with tqdm(total=len(delayed_tasks), desc="Processing tickers") as pbar:
-                for result in compute(*delayed_tasks):
-                    ticker, ticker_df = result
-                    data_dict[ticker] = ticker_df
-                    pbar.update(1)
-
-        else:
-            # Optimized pandas reading
-            if tickers:
-                # Use pyarrow with predicate pushdown
-                data_df = pd.read_parquet(
-                    file_path,
-                    engine=engine,
-                    filters=[("ticker", "in", tickers)],
-                )
-                unique_tickers = tickers
-            else:
-                data_df = pd.read_parquet(
-                    file_path,
-                    engine=engine,
-                )
-                unique_tickers = data_df["ticker"].unique()
-
-            # Use more efficient groupby operation with progress bar
-            data_dict = {}
-            grouped = data_df.groupby("ticker", observed=True)
-            for ticker in tqdm(unique_tickers, desc="Processing tickers"):
-                group = grouped.get_group(ticker)
-                data_dict[ticker] = group.drop("ticker", axis=1)
+                logging.warning(f"File {file_path} does not exist.")
 
         self.data = data_dict
         logging.info(f"{data_type.capitalize()} data loaded successfully")
