@@ -378,11 +378,13 @@ class ParameterOptimizer:
             group_dict[i] = data_dict
         return group_dict
 
+    from tqdm import tqdm
+
     def load_data_from_parquet(
         self, data_type: str, use_dask: bool = False, tickers: list = None
     ):
         """
-        Load data from Parquet files into self.data.
+        Load data from Parquet files into self.data or self.test_data.
 
         Args:
             data_type (str): Specify 'train' or 'test' to load the corresponding data.
@@ -404,37 +406,39 @@ class ParameterOptimizer:
         logging.info(f"Loading {data_type} data from {file_path}")
 
         if use_dask:
-            # Use Dask DataFrame for large datasets
+
             if tickers:
-                # Use filters to read only specific tickers
                 filters = [("ticker", "in", tickers)]
                 data_df = dd.read_parquet(file_path, filters=filters)
             else:
                 data_df = dd.read_parquet(file_path)
-        else:
-            # Use pandas DataFrame for smaller datasets
-            data_df = pd.read_parquet(file_path)
-            if tickers:
-                data_df = data_df[data_df["ticker"].isin(tickers)]
 
-        # Process the DataFrame into a dictionary of DataFrames per ticker
-        if use_dask:
-            # Convert Dask DataFrame to a dictionary of Dask DataFrames per ticker
+            # Process the DataFrame into a dictionary of pandas DataFrames per ticker
             if tickers:
                 unique_tickers = tickers
             else:
                 unique_tickers = data_df["ticker"].unique().compute()
+
             data_dict = {}
-            for ticker in unique_tickers:
+            # Add tqdm progress bar here
+            for ticker in tqdm(unique_tickers, desc="Processing tickers"):
                 ticker_df = data_df[data_df["ticker"] == ticker].drop("ticker", axis=1)
+                # Convert to pandas DataFrame
                 ticker_df = ticker_df.compute()
                 data_dict[ticker] = ticker_df
         else:
-            # Convert pandas DataFrame to a dictionary of pandas DataFrames per ticker
-            data_dict = {
-                ticker: df.drop("ticker", axis=1)
-                for ticker, df in data_df.groupby("ticker")
-            }
+            # Use pandas with fastparquet engine
+            data_df = pd.read_parquet(file_path, engine="fastparquet")
+            if tickers:
+                data_df = data_df[data_df["ticker"].isin(tickers)]
+
+            # Process the DataFrame into a dictionary of pandas DataFrames per ticker
+            data_dict = {}
+            # Add tqdm progress bar here
+            for ticker, df in tqdm(
+                data_df.groupby("ticker"), desc="Processing tickers"
+            ):
+                data_dict[ticker] = df.drop("ticker", axis=1)
 
         self.data = data_dict
         logging.info(f"{data_type.capitalize()} data loaded successfully")
