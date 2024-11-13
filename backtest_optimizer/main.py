@@ -81,6 +81,8 @@ def calc_returns(args):
 
 
 class ParameterOptimizer:
+    shared_data = {}
+
     def __init__(
         self, calc_pl: callable, save_path: str, save_file_prefix: str, n_jobs: int
     ):
@@ -100,7 +102,7 @@ class ParameterOptimizer:
         self.top_params_list = None
         self.current_group = None
         self.group_indices = None
-        self.data = {}
+        ParameterOptimizer.shared_data = {}
         self.save_path = save_path
         self.file_prefix = save_file_prefix
         self.n_jobs = n_jobs
@@ -208,26 +210,14 @@ class ParameterOptimizer:
                 errors = self.check_single_dataframe(ticker, df)
                 if errors:
                     error_messages.extend(errors)
-                    continue  # Skip this DataFrame if errors are found
 
-                # Infer frequency for alignment
-                if len(df) > 1:
-                    try:
-                        sample_size = min(len(df), 1000)
-                        sample = df.index[:sample_size]
-                        freq = pd.infer_freq(sample)
-                        if freq:
-                            frequencies.append(freq)
-                    except Exception:
-                        pass
             except Exception as e:
                 logging.warning(f"Error processing {ticker}: {str(e)}")
                 continue
 
         # If any errors were found during index checks, log them and exit
         if error_messages:
-            logging.error(f"Data integrity check failed: {error_messages}")
-            return
+            logging.warning(f"Data integrity check errors: {error_messages}")
 
         # Step 2: Align DataFrames to max index using memory-efficient approach
         try:
@@ -251,9 +241,20 @@ class ParameterOptimizer:
             if df.empty:
                 continue
             try:
-                # Ensure index is a DatetimeIndex
+                # Ensure index is a DatetimeIndex and remove timezone
                 if not isinstance(df.index, pd.DatetimeIndex):
                     df.index = pd.to_datetime(df.index)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+
+                # Ensure train_end_ts is timezone-naive
+                if (
+                    isinstance(train_end_ts, pd.Timestamp)
+                    and train_end_ts.tz is not None
+                ):
+                    train_end_ts = train_end_ts.tz_localize(None)
+                elif not isinstance(train_end_ts, pd.Timestamp):
+                    train_end_ts = pd.Timestamp(train_end_ts).tz_localize(None)
 
                 # Sort the index to ensure chronological order
                 df.sort_index(inplace=True)
@@ -274,7 +275,7 @@ class ParameterOptimizer:
                         train_df[col] = train_df[col].astype("int32")
                         test_df[col] = test_df[col].astype("int32")
 
-                self.data[ticker] = train_df
+                ParameterOptimizer.shared_data[ticker] = train_df
 
                 # Save the training and testing sets to disk in Parquet format
                 train_file_path = os.path.join(train_dir, f"{ticker}.parquet")
@@ -354,36 +355,9 @@ class ParameterOptimizer:
 
         return (is_test, paths, path_folds)
 
-    def generate_group_dict(self, is_train: bool) -> dict:
-
-        group_dict = {}
-        for ticker, df in self.data.items():
-            if ticker not in self.current_group:
-                continue
-            select_idx = self.current_group[ticker]["train"]
-            if self.current_group[ticker]["test"] and not is_train:
-                select_idx = self.current_group[ticker]["test"]
-            for i, idx in enumerate(select_idx):
-                if i not in group_dict:
-                    group_dict[i] = {}
-                new_df = df.iloc[idx]
-                if not new_df.empty:
-                    group_dict[i][ticker] = new_df
-
-        logging.info("Checking datetime integrity for tickers")
-        for i, data_dict in group_dict.items():
-            self.check_datetime_index_integrity(data_dict)
-            data_dict = {
-                ticker: ImmutableDataFrame(df) for ticker, df in data_dict.items()
-            }
-            group_dict[i] = data_dict
-        return group_dict
-
-    from tqdm import tqdm
-
     def load_data_from_parquet(self, data_type: str, tickers: list = None):
         """
-        Load data from individual Parquet files into self.data or self.test_data.
+        Load data from individual Parquet files into ParameterOptimizer.shared_data.
 
         Args:
             data_type (str): Specify 'train' or 'test' to load the corresponding data.
@@ -411,7 +385,7 @@ class ParameterOptimizer:
             else:
                 logging.warning(f"File {file_path} does not exist.")
 
-        self.data = data_dict
+        ParameterOptimizer.shared_data = data_dict
         logging.info(f"{data_type.capitalize()} data loaded successfully")
 
     def generate_group_indices(self, is_train: bool):
@@ -425,7 +399,7 @@ class ParameterOptimizer:
             dict: A dictionary mapping group numbers to indices.
         """
         group_indices = {}
-        for ticker, df in self.data.items():
+        for ticker, df in ParameterOptimizer.shared_data.items():
             if ticker not in self.current_group:
                 continue
             select_idx = self.current_group[ticker]["train"]
@@ -452,8 +426,8 @@ class ParameterOptimizer:
         for group_num, ticker_indices in group_indices.items():
             group_data = {}
             for ticker, indices in ticker_indices.items():
-                df = self.data[ticker].iloc[indices]
-                group_data[ticker] = df
+                df = ParameterOptimizer.shared_data[ticker].iloc[indices]
+                group_data[ticker] = df.copy(deep=False)
             returns = self.calc_pl(group_data, params)
             final_returns.append(returns)
 
@@ -543,7 +517,7 @@ class ParameterOptimizer:
                 "Using the entire dataset as the training set with no validation groups."
             )
             self.combcv_dict[0] = {}
-            for ticker, df in self.data.items():
+            for ticker, df in ParameterOptimizer.shared_data.items():
                 self.combcv_dict[0][ticker] = {
                     "train": [np.arange(len(df))],
                     "test": None,
@@ -552,7 +526,7 @@ class ParameterOptimizer:
             logging.info(
                 f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
             )
-            for ticker, df in self.data.items():
+            for ticker, df in ParameterOptimizer.shared_data.items():
 
                 if len(df) > total_comb * 50:
                     data_length = len(df)
@@ -575,33 +549,39 @@ class ParameterOptimizer:
                             "test": test_indices,
                         }
 
-    def objective(self, trial: optuna.Trial) -> float:
-        trial_params = {}
-        for k, v in self.params_dict.items():
-            if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
-                trial_params[k] = v
-            elif all(isinstance(item, int) for item in v):
-                trial_params[k] = trial.suggest_categorical(k, v)
-            elif any(isinstance(item, float) for item in v):
-                trial_params[k] = trial.suggest_categorical(k, v)
-            else:
-                trial_params[k] = trial.suggest_categorical(k, v)
+    def create_objective(self, group_indices, params_dict):
+        """Create a standalone objective function that doesn't rely on instance variables."""
 
-        current_params = trial.params
-        existing_trials = trial.study.get_trials(deepcopy=False)
-        completed_trials = [
-            t for t in existing_trials if t.state == optuna.trial.TrialState.COMPLETE
-        ]
-        existing_params = [t.params for t in completed_trials]
-        if current_params in existing_params:
-            logging.info(
-                f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
-            )
-            raise optuna.TrialPruned()
+        def objective(trial):
+            trial_params = {}
+            for k, v in params_dict.items():
+                if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+                    trial_params[k] = v
+                elif all(isinstance(item, int) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                elif any(isinstance(item, float) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                else:
+                    trial_params[k] = trial.suggest_categorical(k, v)
 
-        # Access self.train_group_dict directly
-        sharpe, _ = self.combcv_pl(trial_params, self.group_indices)
-        return sharpe
+            current_params = trial.params
+            existing_trials = trial.study.get_trials(deepcopy=False)
+            completed_trials = [
+                t
+                for t in existing_trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ]
+            existing_params = [t.params for t in completed_trials]
+            if current_params in existing_params:
+                logging.info(
+                    f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
+                )
+                raise optuna.TrialPruned()
+
+            sharpe, _ = self.combcv_pl(trial_params, group_indices)
+            return sharpe
+
+        return objective
 
     def optimize(
         self,
@@ -627,17 +607,20 @@ class ParameterOptimizer:
         for fold_num, train_test_splits in self.combcv_dict.items():
             logging.info(f"Starting optimization for group: {fold_num}")
             self.current_group = train_test_splits
-            self.group_indices = self.generate_group_indices(is_train=True)
+
+            # Generate indices once before optimization
+            group_indices = self.generate_group_indices(is_train=True)
+
+            # Create a standalone objective function with necessary data
+            objective_func = self.create_objective(group_indices, self.params_dict)
 
             study = optuna.create_study(
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(multivariate=True),
             )
-            study.optimize(
-                self.objective,
-                n_trials=n_runs,
-                n_jobs=self.n_jobs,  # Set to a positive integer
-            )
+
+            # Pass the standalone objective function to optimize
+            study.optimize(objective_func, n_trials=n_runs, n_jobs=self.n_jobs)
 
             all_trials = sorted(
                 [
@@ -738,7 +721,9 @@ class ParameterOptimizer:
                 params = self.best_params_by_fold[fold]
                 for ticker, path_array in self.backtest_paths.items():
                     test_indices = np.where(path_array[:, path_num] == fold)[0]
-                    tmp_dict[ticker] = self.data[ticker].iloc[test_indices]
+                    tmp_dict[ticker] = ParameterOptimizer.shared_data[ticker].iloc[
+                        test_indices
+                    ]
                 returns = self.calc_pl(tmp_dict, params)
                 path_returns.append(returns)
 
@@ -1173,27 +1158,29 @@ class ParameterOptimizer:
             errors.append(f"Index for {ticker} is not monotonically increasing.")
 
         if len(df) > 1:
-            # Attempt to infer frequency
-            freq = None
             try:
-                freq = pd.infer_freq(df.index)
-                if not freq:
-                    errors.append(f"Could not infer frequency for {ticker}.")
-            except Exception as e:
-                errors.append(f"Could not infer frequency for {ticker}: {str(e)}")
+                # Calculate the most common time difference
+                diffs = df.index.to_series().diff().dropna()
+                expected_timedelta = diffs.mode()[0]
 
-            # Check for gaps in the index based on the inferred frequency
-            expected_freq = (
-                freq if freq else "B"
-            )  # Use inferred frequency or default to 'B'
-            expected_timedelta = pd.Timedelta(
-                pd.tseries.frequencies.to_offset(expected_freq)
-            )
-            diffs = df.index.to_series().diff().dropna()
-            gaps = diffs > expected_timedelta
-            if gaps.any():
+                if expected_timedelta.total_seconds() == 0:
+                    errors.append(
+                        f"Invalid zero time difference detected for {ticker}."
+                    )
+
+                # Check for gaps in the index based on the most common difference
+                gaps = diffs > expected_timedelta
+                if gaps.any():
+                    gap_count = gaps.sum()
+                    max_gap = diffs[gaps].max()
+                    errors.append(
+                        f"DataFrame for {ticker} has {gap_count} gaps in its index. "
+                        f"Largest gap is {max_gap}. Expected interval is {expected_timedelta}."
+                    )
+
+            except Exception as e:
                 errors.append(
-                    f"DataFrame for {ticker} has gaps in its index based on expected {expected_freq} frequency."
+                    f"Could not analyze time differences for {ticker}: {str(e)}"
                 )
 
         return errors
