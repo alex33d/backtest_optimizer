@@ -246,7 +246,8 @@ class ParameterOptimizer:
         os.makedirs(test_dir, exist_ok=True)
 
         # Process each DataFrame individually
-        for ticker, df in tqdm(data_dict.items(), desc="Processing tickers"):
+        for ticker in tqdm(list(data_dict.keys()), desc="Processing tickers"):
+            df = data_dict[ticker]
             if df.empty:
                 continue
             try:
@@ -284,6 +285,7 @@ class ParameterOptimizer:
 
                 # Clean up to free memory
                 del df, train_df, test_df
+                del data_dict[ticker]
                 gc.collect()
 
             except Exception as e:
