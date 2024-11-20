@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name="Backtest-Optimizer",
-    version="0.3.7",
+    version="0.3.8",
     author="Alexnader Demachev",
     author_email="alexdemachev@gmail.com",
     description="Hyperparameter search with Combinatorial Cross Validation",
@@ -30,5 +30,6 @@ setup(
         "statsmodels",
         "tqdm",
         "matplotlib",
+        "memory_profiler",
     ],
 )

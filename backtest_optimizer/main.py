@@ -20,24 +20,15 @@ import math
 from tqdm import tqdm
 import optuna
 from optuna.pruners import BasePruner
-from multiprocessing import Pool, Manager, set_start_method, get_start_method
+from multiprocessing import Pool
 import itertools
 from typing import Any, List, Dict, Union, Tuple, Optional, Set
 import matplotlib.pyplot as plt
-from itertools import combinations
 from collections.abc import Iterable
 from functools import partial
 import logging
-import matplotlib
 import itertools as itt
-import threading
-from itertools import groupby
-from operator import itemgetter
 import gc
-import dask.dataframe as dd
-from dask import delayed, compute
-import dask
-from collections import Counter
 
 from metrics import *
 from backtest_stress_tests import run_stress_tests
@@ -80,8 +71,63 @@ def calc_returns(args):
     return returns
 
 
+def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
+    """Create a standalone objective function that doesn't rely on instance variables."""
+
+    def objective(trial):
+        try:
+            trial_params = {}
+            for k, v in params_dict.items():
+                if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+                    trial_params[k] = v
+                elif all(isinstance(item, int) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                elif any(isinstance(item, float) for item in v):
+                    trial_params[k] = trial.suggest_categorical(k, v)
+                else:
+                    trial_params[k] = trial.suggest_categorical(k, v)
+
+            current_params = trial.params
+            existing_trials = trial.study.get_trials(deepcopy=False)
+            completed_trials = [
+                t
+                for t in existing_trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ]
+            existing_params = [t.params for t in completed_trials]
+            if current_params in existing_params:
+                logging.info(
+                    f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
+                )
+                raise optuna.TrialPruned()
+
+            sharpe, _ = combcv_pl(trial_params, group_indices, calc_pl_func, data_dict)
+            return sharpe
+        except Exception as e:
+            logging.error(f"Error in trial {trial.number}: {e}")
+            raise
+
+    return objective
+
+
+def combcv_pl(
+    params: dict, group_indices: dict, calc_pl_func: callable, data_dict: dict
+) -> tuple:
+    final_returns = []
+    for group_num, ticker_indices in group_indices.items():
+        group_data = {}
+        for ticker, indices in ticker_indices.items():
+            df = data_dict[ticker]
+            group_data[ticker] = df.iloc[indices]
+        returns = calc_pl_func(group_data, params)
+        final_returns.append(returns)
+
+    sharpe_ratios = [annual_sharpe(r) for r in final_returns if not r.empty]
+    final_sharpe = np.nanmean(sharpe_ratios)
+    return final_sharpe, final_returns
+
+
 class ParameterOptimizer:
-    shared_data = {}
 
     def __init__(
         self, calc_pl: callable, save_path: str, save_file_prefix: str, n_jobs: int
@@ -102,7 +148,7 @@ class ParameterOptimizer:
         self.top_params_list = None
         self.current_group = None
         self.group_indices = None
-        ParameterOptimizer.shared_data = {}
+        self.data_dict = {}
         self.save_path = save_path
         self.file_prefix = save_file_prefix
         self.n_jobs = n_jobs
@@ -269,13 +315,11 @@ class ParameterOptimizer:
                 ).columns
                 for col in numerical_cols:
                     if train_df[col].dtype == "float64":
-                        train_df[col] = train_df[col].astype("float32")
-                        test_df[col] = test_df[col].astype("float32")
+                        train_df[col] = train_df[col].astype("float32", copy=False)
+                        test_df[col] = test_df[col].astype("float32", copy=False)
                     elif train_df[col].dtype == "int64":
-                        train_df[col] = train_df[col].astype("int32")
-                        test_df[col] = test_df[col].astype("int32")
-
-                ParameterOptimizer.shared_data[ticker] = train_df
+                        train_df[col] = train_df[col].astype("int32", copy=False)
+                        test_df[col] = test_df[col].astype("int32", copy=False)
 
                 # Save the training and testing sets to disk in Parquet format
                 train_file_path = os.path.join(train_dir, f"{ticker}.parquet")
@@ -385,21 +429,23 @@ class ParameterOptimizer:
             else:
                 logging.warning(f"File {file_path} does not exist.")
 
-        ParameterOptimizer.shared_data = data_dict
         logging.info(f"{data_type.capitalize()} data loaded successfully")
 
-    def generate_group_indices(self, is_train: bool):
+        return data_dict
+
+    def generate_group_indices(self, data_dict: dict, is_train: bool):
         """
         Generate group indices for training or testing.
 
         Args:
+            data_dict (dict): dictionary with data
             is_train (bool): Whether to generate indices for training or testing.
 
         Returns:
             dict: A dictionary mapping group numbers to indices.
         """
         group_indices = {}
-        for ticker, df in ParameterOptimizer.shared_data.items():
+        for ticker, df in data_dict.items():
             if ticker not in self.current_group:
                 continue
             select_idx = self.current_group[ticker]["train"]
@@ -410,32 +456,6 @@ class ParameterOptimizer:
                     group_indices[i] = {}
                 group_indices[i][ticker] = idx  # Store indices instead of DataFrames
         return group_indices
-
-    def combcv_pl(self, params: dict, group_indices: dict) -> tuple:
-        """
-        Calculate performance metrics using combinatorial cross-validation.
-
-        Args:
-            params (dict): Parameters for the performance calculation.
-            group_indices (dict): Dictionary of indices for each group.
-
-        Returns:
-            tuple: (final_sharpe, final_returns) calculated metrics.
-        """
-        final_returns = []
-        for group_num, ticker_indices in group_indices.items():
-            group_data = {}
-            for ticker, indices in ticker_indices.items():
-                df = ParameterOptimizer.shared_data[ticker].iloc[indices]
-                group_data[ticker] = df.copy(deep=False)
-            returns = self.calc_pl(group_data, params)
-            final_returns.append(returns)
-
-        sharpe_ratios = [
-            annual_sharpe(returns) for returns in final_returns if not returns.empty
-        ]
-        final_sharpe = np.nanmean(sharpe_ratios)
-        return final_sharpe, final_returns
 
     def plot_returns(self, data_dict, params: dict):
         """
@@ -487,7 +507,7 @@ class ParameterOptimizer:
                 "Wrong data type for plotting returns, accepted types are pd.Series and dict"
             )
 
-    def create_combcv_dict(self, n_splits: int, n_test_splits: int):
+    def create_combcv_dict(self, data_dict, n_splits: int, n_test_splits: int):
         """
         Create a dictionary for combinatorial cross-validation.
 
@@ -517,7 +537,7 @@ class ParameterOptimizer:
                 "Using the entire dataset as the training set with no validation groups."
             )
             self.combcv_dict[0] = {}
-            for ticker, df in ParameterOptimizer.shared_data.items():
+            for ticker, df in data_dict.items():
                 self.combcv_dict[0][ticker] = {
                     "train": [np.arange(len(df))],
                     "test": None,
@@ -526,7 +546,7 @@ class ParameterOptimizer:
             logging.info(
                 f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
             )
-            for ticker, df in ParameterOptimizer.shared_data.items():
+            for ticker, df in data_dict.items():
 
                 if len(df) > total_comb * 50:
                     data_length = len(df)
@@ -549,42 +569,10 @@ class ParameterOptimizer:
                             "test": test_indices,
                         }
 
-    def create_objective(self, group_indices, params_dict):
-        """Create a standalone objective function that doesn't rely on instance variables."""
-
-        def objective(trial):
-            trial_params = {}
-            for k, v in params_dict.items():
-                if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
-                    trial_params[k] = v
-                elif all(isinstance(item, int) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
-                elif any(isinstance(item, float) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
-                else:
-                    trial_params[k] = trial.suggest_categorical(k, v)
-
-            current_params = trial.params
-            existing_trials = trial.study.get_trials(deepcopy=False)
-            completed_trials = [
-                t
-                for t in existing_trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-            existing_params = [t.params for t in completed_trials]
-            if current_params in existing_params:
-                logging.info(
-                    f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
-                )
-                raise optuna.TrialPruned()
-
-            sharpe, _ = self.combcv_pl(trial_params, group_indices)
-            return sharpe
-
-        return objective
-
     def optimize(
         self,
+        n_splits: int,
+        n_test_splits: int,
         params: dict,
         n_runs: int,
         best_trials_pct: float,
@@ -593,15 +581,20 @@ class ParameterOptimizer:
         Optimize parameters using Optuna.
 
         Args:
+            n_splits (int): number of total groups.
+            n_test_splits (int): number of test groups.
             params (dict): Initial parameters for the optimization.
-            n_jobs (int): Number of parallel jobs.
             n_runs (int): Number of optimization runs.
             best_trials_pct (float): Percentage of best trials to consider.
-            save_file_name (str, optional): File name to save the results.
         """
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
+        data_dict = self.load_data_from_parquet("train")
+
+        self.create_combcv_dict(
+            data_dict, n_splits=n_splits, n_test_splits=n_test_splits
+        )
 
         # Create the objective function closure
         for fold_num, train_test_splits in self.combcv_dict.items():
@@ -609,17 +602,18 @@ class ParameterOptimizer:
             self.current_group = train_test_splits
 
             # Generate indices once before optimization
-            group_indices = self.generate_group_indices(is_train=True)
+            group_indices = self.generate_group_indices(data_dict, is_train=True)
 
-            # Create a standalone objective function with necessary data
-            objective_func = self.create_objective(group_indices, self.params_dict)
+            # Pass calc_pl and data_dict explicitly
+            objective_func = create_objective(
+                group_indices, self.params_dict, self.calc_pl, data_dict
+            )
 
             study = optuna.create_study(
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(multivariate=True),
             )
 
-            # Pass the standalone objective function to optimize
             study.optimize(objective_func, n_trials=n_runs, n_jobs=self.n_jobs)
 
             all_trials = sorted(
@@ -640,9 +634,14 @@ class ParameterOptimizer:
             top_params = all_trials[: max(1, int(len(all_trials) * best_trials_pct))]
             logging.info(f"Top {best_trials_pct} param combinations are: {top_params}")
 
-            self.group_indices = self.generate_group_indices(is_train=False)
+            group_indices = self.generate_group_indices(data_dict, is_train=False)
             for i, trial_params in enumerate(top_params):
-                sharpe, returns_list = self.combcv_pl(trial_params, self.group_indices)
+                sharpe, returns_list = combcv_pl(
+                    params=trial_params,
+                    group_indices=group_indices,
+                    calc_pl_func=self.calc_pl,
+                    data_dict=data_dict,
+                )
                 if i == 0:
                     trial_params["fold_num"] = fold_num
                 else:
@@ -692,6 +691,8 @@ class ParameterOptimizer:
         Reconstruct equity curves based on the best parameters.
         """
 
+        data_dict = self.load_data_from_parquet(data_type="train")
+
         logging.info("Reconstructing val equity curves")
 
         arrays = list(self.backtest_paths.values())
@@ -721,9 +722,7 @@ class ParameterOptimizer:
                 params = self.best_params_by_fold[fold]
                 for ticker, path_array in self.backtest_paths.items():
                     test_indices = np.where(path_array[:, path_num] == fold)[0]
-                    tmp_dict[ticker] = ParameterOptimizer.shared_data[ticker].iloc[
-                        test_indices
-                    ]
+                    tmp_dict[ticker] = data_dict[ticker].iloc[test_indices]
                 returns = self.calc_pl(tmp_dict, params)
                 path_returns.append(returns)
 
@@ -759,22 +758,20 @@ class ParameterOptimizer:
         plt.savefig(self.save_path + "CombCV_equity_curves.png")
         plt.show()
 
-    def run_stress_tests(self, num_workers=5):
+    def run_stress_tests(self, data_dict, num_workers=5):
         """
         Run stress tests on the best parameter sets.
         """
         logging.info(f"Running stress tests, num_workers: {num_workers}")
 
         # Create local references to necessary data
-        shared_train_data = self.data.copy()
+
         all_tested_params = self.all_tested_params.copy()
         calc_pl = self.calc_pl  # Local reference to avoid pickling self
 
         with Pool(processes=num_workers) as pool:
             # Create arguments for the calc_returns function
-            args = [
-                (calc_pl, params, shared_train_data) for params in all_tested_params
-            ]
+            args = [(calc_pl, params, data_dict) for params in all_tested_params]
             results = list(
                 tqdm(
                     pool.imap(calc_returns, args),
@@ -1036,7 +1033,6 @@ class ParameterOptimizer:
         Args:
             data_dict (Dict[str, pd.DataFrame]): Data for processing.
             params (Dict[str, Any]): Parameters for the performance calculation. May contain lists of values.
-            file_prefix (str): Prefix for output files.
         """
         logging.info("Processing parameter combinations")
 
@@ -1112,7 +1108,6 @@ class ParameterOptimizer:
 
         Args:
             results (List[Dict[str, Any]]): List of processed results.
-            file_prefix (str): Prefix for the plot file name.
         """
         plt.figure(figsize=(12, 8))
         for i, result in enumerate(results, 1):
