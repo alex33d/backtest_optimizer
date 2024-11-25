@@ -1022,7 +1022,6 @@ class ParameterOptimizer:
 
     def plot_multiple_param_combinations(
         self,
-        n_jobs: int,
         data_dict: Dict[str, pd.DataFrame],
         params: Dict[str, Any],
     ):
@@ -1049,7 +1048,7 @@ class ParameterOptimizer:
         total_combinations = len(param_combinations)
         logging.info(f"Total parameter combinations to process: {total_combinations}")
 
-        # Prepare the partial function for multiprocessing
+        # Prepare the partial function for processing
         partial_process = partial(
             process_combination,
             data_dict=data_dict,
@@ -1058,11 +1057,21 @@ class ParameterOptimizer:
             calculate_metrics=calculate_metrics,
         )
 
-        # Use multiprocessing to process all combinations
-        with multiprocessing.Pool(n_jobs) as pool:
+        # Choose between multiprocessing and single-process execution
+        if self.n_jobs > 1:
+            # Use multiprocessing for parallel execution
+            with multiprocessing.Pool(self.n_jobs) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap_unordered(partial_process, param_combinations),
+                        total=total_combinations,
+                    )
+                )
+        else:
+            # Single-process execution
             results = list(
                 tqdm(
-                    pool.imap_unordered(partial_process, param_combinations),
+                    (partial_process(combo) for combo in param_combinations),
                     total=total_combinations,
                 )
             )
