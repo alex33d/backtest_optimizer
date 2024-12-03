@@ -276,8 +276,8 @@ class ParameterOptimizer:
         train_end_ts = pd.Timestamp(train_end)
 
         # Prepare directories to save individual ticker data
-        train_dir = os.path.join(self.save_path, "train_data")
-        test_dir = os.path.join(self.save_path, "test_data")
+        train_dir = os.path.join(self.save_path, f"{self.file_prefix}_train_data")
+        test_dir = os.path.join(self.save_path, f"{self.file_prefix}_test_data")
         os.makedirs(train_dir, exist_ok=True)
         os.makedirs(test_dir, exist_ok=True)
 
@@ -410,7 +410,7 @@ class ParameterOptimizer:
         if data_type not in ("train", "test"):
             raise ValueError("data_type must be 'train' or 'test'")
 
-        dir_path = os.path.join(self.save_path, f"{data_type}_data")
+        dir_path = os.path.join(self.save_path, f"{self.file_prefix}_{data_type}_data")
 
         if not os.path.exists(dir_path):
             raise FileNotFoundError(f"{dir_path} does not exist.")
@@ -755,7 +755,7 @@ class ParameterOptimizer:
         ax.set_xlabel("Date", fontsize=14)
         ax.set_ylabel("Cumulative Returns", fontsize=14)
         ax.set_title("Cumulative Returns Over Time", fontsize=16)
-        plt.savefig(self.save_path + "CombCV_equity_curves.png")
+        plt.savefig(self.save_path + f"{self.file_prefix}_CombCV_equity_curves.png")
         plt.show()
 
     def run_stress_tests(self, data_dict, num_workers=5):
