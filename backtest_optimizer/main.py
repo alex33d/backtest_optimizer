@@ -842,7 +842,7 @@ class ParameterOptimizer:
 
         return elbow_point
 
-    def cluster_and_aggregate(self) -> dict:
+    def cluster_and_aggregate(self, min_sharpe=None) -> dict:
         """
         Cluster parameter sets and aggregate the best parameters.
 
@@ -853,18 +853,18 @@ class ParameterOptimizer:
         logging.info("Starting clustering")
 
         if isinstance(self.top_params_list, list):
-            param_df = (
-                pd.DataFrame(self.top_params_list)
-                .drop(columns=["sharpe"])
-                .dropna(axis=1)
-            )
+            param_df = pd.DataFrame(self.top_params_list)
         elif isinstance(self.top_params_list, pd.DataFrame):
-            param_df = self.top_params_list.drop(columns=["sharpe"]).dropna(axis=1)
+            param_df = self.top_params_list
             self.top_params_list = self.top_params_list.to_dict("records")
         else:
             raise Exception(
                 "Wrong data format for top params, accepted formats are list/DataFrame"
             )
+
+        if min_sharpe:
+            param_df = param_df[param_df["sharpe"] > min_sharpe]
+        param_df = param_df.drop(columns=["sharpe"]).dropna(axis=1)
 
         max_clusters = min(max(3, len(param_df) // 3), len(param_df))
         if max_clusters > 2:
