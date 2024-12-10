@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import logging
+
 
 def max_drawdown(returns):
     """
@@ -11,18 +13,30 @@ def max_drawdown(returns):
     max_drawdown = drawdown.min()
     return max_drawdown
 
+
 def annual_sharpe(returns, N=365):
+    if returns.std() == 0:
+        logging.warning(
+            "Standard deviation of returns is zero. Sharpe ratio is set to NaN."
+        )
+        return np.nan
+
     if isinstance(returns, pd.Series) and not returns.empty:
-        returns = returns.resample('D').sum()
+        returns = returns.resample("D").sum()
         return np.sqrt(N) * returns.mean() / returns.std()
     elif isinstance(returns, np.ndarray):
         return np.sqrt(N) * returns.mean() / returns.std()
     else:
-        return None
+        logging.warning(
+            "Wrong format for returns, accepted is ndarray or pandas series"
+        )
+        return np.nan
+
 
 def annual_returns(returns, N=365):
-    returns = returns.resample('D').sum()
+    returns = returns.resample("D").sum()
     return np.mean(returns) * N
+
 
 def calmar_ratio(returns, risk_free_rate=0.0, N=365):
     """
@@ -33,22 +47,24 @@ def calmar_ratio(returns, risk_free_rate=0.0, N=365):
     calmar = (annual_return - risk_free_rate) / abs(max_dd)
     return calmar
 
+
 def sortino_ratio(returns, risk_free_rate=0.0, N=365):
     """
     Calculate the Sortino ratio of a returns series.
     """
-    returns = returns.resample('D').sum()
+    returns = returns.resample("D").sum()
     downside_risk = np.sqrt(np.mean(np.minimum(0, returns) ** 2)) * np.sqrt(N)
     annual_return = np.mean(returns) * N  # Assuming daily returns
     sortino = (annual_return - risk_free_rate) / downside_risk
     return sortino
 
+
 def calculate_metrics(returns):
     metrics = {
-        'sharpe': annual_sharpe(returns),
-        'max_drawdown': max_drawdown(returns),
-        'calmar_ratio': calmar_ratio(returns),
-        'sortino_ratio': sortino_ratio(returns),
-        'annual_returns': annual_returns(returns),
+        "sharpe": annual_sharpe(returns),
+        "max_drawdown": max_drawdown(returns),
+        "calmar_ratio": calmar_ratio(returns),
+        "sortino_ratio": sortino_ratio(returns),
+        "annual_returns": annual_returns(returns),
     }
     return metrics

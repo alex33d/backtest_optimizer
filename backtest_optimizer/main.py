@@ -102,10 +102,18 @@ def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
                 raise optuna.TrialPruned()
 
             sharpe, _ = combcv_pl(trial_params, group_indices, calc_pl_func, data_dict)
+
+            if np.isnan(sharpe):
+                logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
+                return -1e6
+
             return sharpe
+
+        except optuna.TrialPruned:
+            raise  # Allow Optuna to handle pruning
         except Exception as e:
             logging.error(f"Error in trial {trial.number}: {e}")
-            raise
+            return -1e6  # Assign a large negative penalty
 
     return objective
 
@@ -117,12 +125,38 @@ def combcv_pl(
     for group_num, ticker_indices in group_indices.items():
         group_data = {}
         for ticker, indices in ticker_indices.items():
-            df = data_dict[ticker]
+            df = data_dict.get(ticker)
+            if df is None or df.empty:
+                logging.warning(f"Ticker {ticker} has no data for group {group_num}.")
+                continue
             group_data[ticker] = df.iloc[indices]
+        if not group_data:
+            logging.warning(f"No valid tickers in group {group_num}. Skipping.")
+            continue
         returns = calc_pl_func(group_data, params)
+        if returns is None or returns.empty:
+            logging.warning(
+                f"calc_pl_func returned empty returns for group {group_num}."
+            )
+            continue
         final_returns.append(returns)
 
-    sharpe_ratios = [annual_sharpe(r) for r in final_returns if not r.empty]
+    if not final_returns:
+        logging.error("All groups returned empty or invalid returns.")
+        return np.nan, final_returns  # Return NaN to indicate failure
+
+    sharpe_ratios = []
+    for r in final_returns:
+        sharpe = annual_sharpe(r)
+        if np.isnan(sharpe):
+            logging.warning("Annual Sharpe ratio calculated as NaN.")
+            continue
+        sharpe_ratios.append(sharpe)
+
+    if not sharpe_ratios:
+        logging.error("All Sharpe ratios are NaN.")
+        return np.nan, final_returns
+
     final_sharpe = np.nanmean(sharpe_ratios)
     return final_sharpe, final_returns
 
