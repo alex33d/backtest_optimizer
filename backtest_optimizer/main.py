@@ -112,7 +112,7 @@ def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
         except optuna.TrialPruned:
             raise  # Allow Optuna to handle pruning
         except Exception as e:
-            logging.error(f"Error in trial {trial.number}: {e}")
+            logging.exception(f"Error in trial {trial.number}")
             return -1e6  # Assign a large negative penalty
 
     return objective
