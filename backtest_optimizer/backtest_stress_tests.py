@@ -10,22 +10,20 @@ from scipy.special import logit
 from scipy.stats import norm, skew, kurtosis
 from joblib import Parallel, delayed
 from statsmodels.distributions.empirical_distribution import ECDF
-
-
-from metrics import *
+from .metrics import *
 
 try:
-    matplotlib.use('TkAgg')
+    matplotlib.use("TkAgg")
 except:
     pass
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("performance_analysis.log", mode='w'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("performance_analysis.log", mode="w"),
+        logging.StreamHandler(),
+    ],
 )
 
 
@@ -68,11 +66,17 @@ def pbo(M: np.ndarray, S: int) -> None:
 
     ecdf = ECDF(lambdas)
     PBO = ecdf(0)
-    logging.info(f'Estimated PBO using statsmodels ECDF: {PBO}')
+    logging.info(f"Estimated PBO using statsmodels ECDF: {PBO}")
 
     sharpe_regression(is_sharpe, oos_sharpe)
-    logging.info('IS R* negative ratio: %f', len([x for x in is_sharpe if x < 0]) / len(is_sharpe))
-    logging.info('OOS R* negative ratio: %f', len([x for x in oos_sharpe if x < 0]) / len(oos_sharpe))
+    logging.info(
+        "IS R* negative ratio: %f",
+        len([x for x in is_sharpe if x < 0]) / len(is_sharpe),
+    )
+    logging.info(
+        "OOS R* negative ratio: %f",
+        len([x for x in oos_sharpe if x < 0]) / len(oos_sharpe),
+    )
 
 
 def monte_carlo(df: pd.DataFrame, n_simulations: int) -> pd.DataFrame:
@@ -86,34 +90,42 @@ def monte_carlo(df: pd.DataFrame, n_simulations: int) -> pd.DataFrame:
     Returns:
         pd.DataFrame: DataFrame containing the simulated paths.
     """
-    df['log_diff'] = np.log(df['close']).diff().dropna()
+    df["log_diff"] = np.log(df["close"]).diff().dropna()
 
     period = 100
-    df['mu'] = df['log_diff'].rolling(period).mean()
-    df['std'] = df['log_diff'].rolling(period).std()
-    df['var'] = df['std'] ** 2
-    df['drift'] = df['mu'] - 0.5 * df['var']
-    s_0 = df['close'].iloc[period - 1]
+    df["mu"] = df["log_diff"].rolling(period).mean()
+    df["std"] = df["log_diff"].rolling(period).std()
+    df["var"] = df["std"] ** 2
+    df["drift"] = df["mu"] - 0.5 * df["var"]
+    s_0 = df["close"].iloc[period - 1]
     df.dropna(inplace=True)
 
     def simulate(df: pd.DataFrame, i: int) -> pd.Series:
         epsilon = np.random.normal(size=len(df))
-        returns = df['drift'] + df['std'] * epsilon
+        returns = df["drift"] + df["std"] * epsilon
 
         S = np.zeros_like(returns)
         S[0] = s_0
         for t in range(1, len(S)):
             S[t] = S[t - 1] * np.exp(returns.iloc[t])
-        return pd.Series(S, name=f'sim_{i}', index=df.index)
+        return pd.Series(S, name=f"sim_{i}", index=df.index)
 
-    simulation_arrays = Parallel(n_jobs=4)(delayed(simulate)(df, i) for i in range(n_simulations))
+    simulation_arrays = Parallel(n_jobs=4)(
+        delayed(simulate)(df, i) for i in range(n_simulations)
+    )
     simulations = pd.concat(simulation_arrays, axis=1)
 
-    return pd.concat([df['close'], simulations], axis=1)
+    return pd.concat([df["close"], simulations], axis=1)
 
 
-def get_simulations_stats(simulation_type: str, init_df: pd.DataFrame, params_dict: Dict[str, Any],
-                          pl_function: callable, n_simulations: int, timeframe: str) -> None:
+def get_simulations_stats(
+    simulation_type: str,
+    init_df: pd.DataFrame,
+    params_dict: Dict[str, Any],
+    pl_function: callable,
+    n_simulations: int,
+    timeframe: str,
+) -> None:
     """
     Generate and plot statistics from simulations.
 
@@ -131,20 +143,25 @@ def get_simulations_stats(simulation_type: str, init_df: pd.DataFrame, params_di
     returns_list = []
     sharpe_list = []
 
-    if simulation_type.lower() == 'monte_carlo':
+    if simulation_type.lower() == "monte_carlo":
         df = monte_carlo(init_df, n_simulations)
         for i in range(n_simulations):
-            path = df[f'sim_{i}']
+            path = df[f"sim_{i}"]
             sample_df = path.resample(timeframe).ohlc()
-            sample_df['size_mult'] = 1
-            sample_df['traded'] = True
-            sample_df['ticker'] = 'BTCUSDT'
+            sample_df["size_mult"] = 1
+            sample_df["traded"] = True
+            sample_df["ticker"] = "BTCUSDT"
             returns = pl_function(sample_df, params_dict)
             returns = returns.sum(axis=1)
             returns_list.append(returns)
     else:
-        meboot_df = pd.read_csv('BTCUSDT_spot_1m_meboot.csv', index_col=0, parse_dates=[0], on_bad_lines='skip')
-        init_price = init_df['close'].iloc[0]
+        meboot_df = pd.read_csv(
+            "BTCUSDT_spot_1m_meboot.csv",
+            index_col=0,
+            parse_dates=[0],
+            on_bad_lines="skip",
+        )
+        init_price = init_df["close"].iloc[0]
         for col in meboot_df.columns:
             returns = meboot_df[col]
             cum_returns = returns.cumsum()
@@ -153,12 +170,12 @@ def get_simulations_stats(simulation_type: str, init_df: pd.DataFrame, params_di
                 new_price = prices[-1] * (1 + r)
                 prices.append(new_price)
             path = pd.Series(prices[1:], index=returns.index)
-            path.index = pd.to_datetime(path.index, errors='coerce')
+            path.index = pd.to_datetime(path.index, errors="coerce")
 
             sample_df = path.resample(timeframe).ohlc()
-            sample_df['size_mult'] = 1
-            sample_df['traded'] = True
-            sample_df['ticker'] = 'BTCUSDT'
+            sample_df["size_mult"] = 1
+            sample_df["traded"] = True
+            sample_df["ticker"] = "BTCUSDT"
             returns = pl_function(sample_df, params_dict)
             returns = returns.sum(axis=1)
             returns_list.append(returns)
@@ -167,26 +184,33 @@ def get_simulations_stats(simulation_type: str, init_df: pd.DataFrame, params_di
     for returns in returns_list:
         ax.plot(returns.cumsum())
         sharpe_list.append(annual_sharpe(returns))
-    ax.set_ylabel('Cumulative Returns')
-    ax.set_xlabel('Date')
-    ax.set_title(f'{simulation_type} simulation results')
+    ax.set_ylabel("Cumulative Returns")
+    ax.set_xlabel("Date")
+    ax.set_title(f"{simulation_type} simulation results")
     ax.legend()
     plt.show()
 
-    plt.hist(sharpe_list, alpha=0.5, color='blue', edgecolor='black')
+    plt.hist(sharpe_list, alpha=0.5, color="blue", edgecolor="black")
     mean = np.mean(sharpe_list)
     percentile_5 = np.percentile(sharpe_list, 5)
-    plt.axvline(mean, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mean:.2f}')
-    plt.axvline(percentile_5, color='green', linestyle='dashed', linewidth=1,
-                label=f'5% Percentile: {percentile_5:.2f}')
-    plt.xlabel('Data Values')
-    plt.ylabel('Frequency')
-    plt.title('Sharpe distribution')
+    plt.axvline(
+        mean, color="red", linestyle="dashed", linewidth=1, label=f"Mean: {mean:.2f}"
+    )
+    plt.axvline(
+        percentile_5,
+        color="green",
+        linestyle="dashed",
+        linewidth=1,
+        label=f"5% Percentile: {percentile_5:.2f}",
+    )
+    plt.xlabel("Data Values")
+    plt.ylabel("Frequency")
+    plt.title("Sharpe distribution")
     plt.legend()
     plt.show()
 
 
-def plot_scatter_sharpe(df: pd.DataFrame, strategy_name: str = 'Strategy name') -> None:
+def plot_scatter_sharpe(df: pd.DataFrame, strategy_name: str = "Strategy name") -> None:
     """
     Plot a scatter plot of Sharpe ratios for hyperparameters.
 
@@ -199,10 +223,10 @@ def plot_scatter_sharpe(df: pd.DataFrame, strategy_name: str = 'Strategy name') 
     """
     from matplotlib.colors import ListedColormap
 
-    cols = [col for col in df.columns if col != 'sharpe']
-    sharpe_ratios = df['sharpe']
+    cols = [col for col in df.columns if col != "sharpe"]
+    sharpe_ratios = df["sharpe"]
 
-    colors = ['red', 'green']
+    colors = ["red", "green"]
     cmap = ListedColormap(colors)
 
     fig = plt.figure()
@@ -210,26 +234,37 @@ def plot_scatter_sharpe(df: pd.DataFrame, strategy_name: str = 'Strategy name') 
 
     if len(cols) == 2:
         ax = fig.add_subplot(111)
-        sc = ax.scatter(df[cols[0]], df[cols[1]], c=sharpe_ratios, cmap=cmap, marker='o')
+        sc = ax.scatter(
+            df[cols[0]], df[cols[1]], c=sharpe_ratios, cmap=cmap, marker="o"
+        )
         ax.set_xlabel(df.columns[0])
         ax.set_ylabel(df.columns[1])
 
     elif len(cols) == 3:
-        ax = fig.add_subplot(111, projection='3d')
-        sc = ax.scatter(df[cols[0]], df[cols[1]], df[cols[2]], c=sharpe_ratios, cmap=cmap, marker='o')
+        ax = fig.add_subplot(111, projection="3d")
+        sc = ax.scatter(
+            df[cols[0]],
+            df[cols[1]],
+            df[cols[2]],
+            c=sharpe_ratios,
+            cmap=cmap,
+            marker="o",
+        )
         ax.set_xlabel(df.columns[0])
         ax.set_ylabel(df.columns[1])
         ax.set_zlabel(df.columns[2])
         ax.view_init(elev=30, azim=45)
     else:
-        logging.error('Unsupported number of dimensions.')
+        logging.error("Unsupported number of dimensions.")
         return
 
-    fig.colorbar(sc, ax=ax, label='Sharpe Ratio')
+    fig.colorbar(sc, ax=ax, label="Sharpe Ratio")
     plt.show()
 
 
-def plot_performance_distributions(M: np.ndarray, actual_sharpe: float, actual_cagr: float) -> None:
+def plot_performance_distributions(
+    M: np.ndarray, actual_sharpe: float, actual_cagr: float
+) -> None:
     """
     Plot distributions of Sharpe Ratios and CAGR.
 
@@ -246,18 +281,30 @@ def plot_performance_distributions(M: np.ndarray, actual_sharpe: float, actual_c
 
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
 
-    axs[0].hist(sharpe_ratios, bins=20, color='blue', alpha=0.7, label='Sharpe Ratios')
-    axs[0].axvline(actual_sharpe, color='r', linestyle='dashed', linewidth=1, label=f'Actual Sharpe: {actual_sharpe}')
-    axs[0].set_title('Distribution of Sharpe Ratios')
-    axs[0].set_xlabel('Sharpe Ratio')
-    axs[0].set_ylabel('Frequency')
+    axs[0].hist(sharpe_ratios, bins=20, color="blue", alpha=0.7, label="Sharpe Ratios")
+    axs[0].axvline(
+        actual_sharpe,
+        color="r",
+        linestyle="dashed",
+        linewidth=1,
+        label=f"Actual Sharpe: {actual_sharpe}",
+    )
+    axs[0].set_title("Distribution of Sharpe Ratios")
+    axs[0].set_xlabel("Sharpe Ratio")
+    axs[0].set_ylabel("Frequency")
     axs[0].legend()
 
-    axs[1].hist(cagr, bins=20, color='green', alpha=0.7, label='CAGR')
-    axs[1].axvline(actual_cagr, color='r', linestyle='dashed', linewidth=1, label=f'Actual CAGR: {actual_cagr}')
-    axs[1].set_title('Distribution of Annual Returns')
-    axs[1].set_xlabel('R')
-    axs[1].set_ylabel('Frequency')
+    axs[1].hist(cagr, bins=20, color="green", alpha=0.7, label="CAGR")
+    axs[1].axvline(
+        actual_cagr,
+        color="r",
+        linestyle="dashed",
+        linewidth=1,
+        label=f"Actual CAGR: {actual_cagr}",
+    )
+    axs[1].set_title("Distribution of Annual Returns")
+    axs[1].set_xlabel("R")
+    axs[1].set_ylabel("Frequency")
     axs[1].legend()
 
     plt.show()
@@ -301,7 +348,7 @@ def calculate_psr(returns: pd.DataFrame, benchmark_sr: float) -> float:
     skewness = skew(returns)
     kurt = kurtosis(returns)
     numerator = sr - benchmark_sr
-    denominator = np.sqrt((1 - skewness * sr + (kurt - 1) / 4.0 * sr ** 2) / T)
+    denominator = np.sqrt((1 - skewness * sr + (kurt - 1) / 4.0 * sr**2) / T)
     z = numerator / denominator
     return norm.cdf(z)
 
@@ -322,8 +369,10 @@ def calculate_dsr(all_returns: pd.DataFrame, selected_returns: pd.DataFrame) -> 
     sharpe_std = np.std(estimated_sharpe_ratio(all_returns))
     N = num_independent_trials(all_returns)
 
-    sharpe_star = sharpe_std * ((1 - emc) * norm.ppf(1 - 1 / N) + emc * norm.ppf(1 - e ** (-1) / N))
-    logging.info('Maximum expected daily sharpe: %f', sharpe_star)
+    sharpe_star = sharpe_std * (
+        (1 - emc) * norm.ppf(1 - 1 / N) + emc * norm.ppf(1 - e ** (-1) / N)
+    )
+    logging.info("Maximum expected daily sharpe: %f", sharpe_star)
 
     return probabilistic_sharpe_ratio(selected_returns, sharpe_star)
 
@@ -362,24 +411,28 @@ def merton_brownian_motion_jump_diffusion(prices: np.ndarray) -> Dict[str, float
         mu, sigma, lambda_, mu_jump, sigma_jump = params
         n = len(returns)
 
-        merton_part = returns - lambda_ * (np.exp(mu_jump + 0.5 * sigma_jump ** 2) - 1)
+        merton_part = returns - lambda_ * (np.exp(mu_jump + 0.5 * sigma_jump**2) - 1)
         ll_merton = np.sum(norm.logpdf(merton_part, loc=mu, scale=sigma))
         ll_jump = np.sum(norm.logpdf(returns, loc=mu_jump, scale=sigma_jump))
 
         return -(ll_merton + ll_jump)
 
     initial_params = np.array([0.0001, 0.01, 0.01, 0.0001, 0.01])
-    result = minimize(neg_log_likelihood, initial_params, args=(log_returns,),
-                      bounds=[(None, None), (0.001, 10), (0, 10), (None, None), (0.001, 10)])
+    result = minimize(
+        neg_log_likelihood,
+        initial_params,
+        args=(log_returns,),
+        bounds=[(None, None), (0.001, 10), (0, 10), (None, None), (0.001, 10)],
+    )
     estimated_params = result.x
     estimated_params = {
-        'mu': estimated_params[0],
-        'sigma': estimated_params[1],
-        'lambda': estimated_params[2],
-        'mu_J': estimated_params[3],
-        'sigma_J': estimated_params[4]
+        "mu": estimated_params[0],
+        "sigma": estimated_params[1],
+        "lambda": estimated_params[2],
+        "mu_J": estimated_params[3],
+        "sigma_J": estimated_params[4],
     }
-    logging.info('Estimated Parameters: %s', estimated_params)
+    logging.info("Estimated Parameters: %s", estimated_params)
 
     n_params = len(initial_params)
     n_obs = len(log_returns)
@@ -388,14 +441,22 @@ def merton_brownian_motion_jump_diffusion(prices: np.ndarray) -> Dict[str, float
     AIC = 2 * n_params - 2 * log_likelihood
     BIC = n_params * np.log(n_obs) - 2 * log_likelihood
 
-    logging.info('AIC: %f', AIC)
-    logging.info('BIC: %f', BIC)
+    logging.info("AIC: %f", AIC)
+    logging.info("BIC: %f", BIC)
     return estimated_params
 
 
-def generate_stochastic_process(mu: float, sigma: float, lambda_: float, mu_jump: float, sigma_jump: float,
-                                init_price: float, T: int = 3, with_chart: bool = False,
-                                n_paths: int = 100) -> pd.DataFrame:
+def generate_stochastic_process(
+    mu: float,
+    sigma: float,
+    lambda_: float,
+    mu_jump: float,
+    sigma_jump: float,
+    init_price: float,
+    T: int = 3,
+    with_chart: bool = False,
+    n_paths: int = 100,
+) -> pd.DataFrame:
     """
     Generate stochastic process using the GBMJD model.
 
@@ -423,15 +484,15 @@ def generate_stochastic_process(mu: float, sigma: float, lambda_: float, mu_jump
         dW = np.sqrt(dt) * np.random.normal(0, 1, n_paths)
         dN = np.random.poisson(lambda_ * dt, n_paths)
         dJ = np.random.normal(mu_jump, sigma_jump, n_paths) * dN
-        S[t] = S[t - 1] * np.exp((mu - 0.5 * sigma ** 2) * dt + sigma * dW + dJ)
+        S[t] = S[t - 1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * dW + dJ)
 
     if with_chart:
         plt.figure(figsize=(10, 6))
         for i in range(min(10, n_paths)):
             plt.plot(np.linspace(0, T, N), S[:, i])
-        plt.xlabel('Time (Years)')
-        plt.ylabel('Price')
-        plt.title('Random Paths using GBMJD')
+        plt.xlabel("Time (Years)")
+        plt.ylabel("Price")
+        plt.title("Random Paths using GBMJD")
         plt.show()
     return pd.DataFrame(S)
 
@@ -460,20 +521,26 @@ def sharpe_regression(IS_sharpe: List, OOS_sharpe: List) -> None:
     reg = LinearRegression().fit(X, Y)
 
     plt.figure(figsize=(10, 6))
-    plt.scatter(IS_sharpe, OOS_sharpe, label='Data Points')
-    plt.plot(IS_sharpe, reg.predict(X), color='red',
-             label=f'Linear Fit: y = {reg.coef_[0]:.2f}x + {reg.intercept_:.2f}')
-    plt.xlabel('In-Sample Sharpe Ratio')
-    plt.ylabel('Out-of-Sample Sharpe Ratio')
-    plt.title('Regression of OOS Sharpe on IS Sharpe')
+    plt.scatter(IS_sharpe, OOS_sharpe, label="Data Points")
+    plt.plot(
+        IS_sharpe,
+        reg.predict(X),
+        color="red",
+        label=f"Linear Fit: y = {reg.coef_[0]:.2f}x + {reg.intercept_:.2f}",
+    )
+    plt.xlabel("In-Sample Sharpe Ratio")
+    plt.ylabel("Out-of-Sample Sharpe Ratio")
+    plt.title("Regression of OOS Sharpe on IS Sharpe")
     plt.legend()
     plt.show()
 
-    logging.info('Coefficient: %f', reg.coef_[0])
-    logging.info('Intercept: %f', reg.intercept_)
+    logging.info("Coefficient: %f", reg.coef_[0])
+    logging.info("Intercept: %f", reg.intercept_)
 
 
-def estimated_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFrame]) -> float:
+def estimated_sharpe_ratio(
+    returns: Union[np.ndarray, pd.Series, pd.DataFrame]
+) -> float:
     """
     Calculate the estimated Sharpe ratio (risk-free rate = 0).
 
@@ -486,9 +553,11 @@ def estimated_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFrame]) 
     return returns.mean() / returns.std(ddof=1)
 
 
-def ann_estimated_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None, periods: int = 261,
-                               sr: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None) -> Union[
-    float, np.ndarray, pd.Series, pd.DataFrame]:
+def ann_estimated_sharpe_ratio(
+    returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None,
+    periods: int = 261,
+    sr: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None,
+) -> Union[float, np.ndarray, pd.Series, pd.DataFrame]:
     """
     Calculate the annualized estimated Sharpe ratio (risk-free rate = 0).
 
@@ -505,9 +574,13 @@ def ann_estimated_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFram
     return sr * np.sqrt(periods)
 
 
-def estimated_sharpe_ratio_stdev(returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None, n: int = None,
-                                 skewness: float = None, kurt: float = None, sr: float = None) -> Union[
-    float, pd.Series]:
+def estimated_sharpe_ratio_stdev(
+    returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None,
+    n: int = None,
+    skewness: float = None,
+    kurt: float = None,
+    sr: float = None,
+) -> Union[float, pd.Series]:
     """
     Calculate the standard deviation of the estimated Sharpe ratio.
 
@@ -533,7 +606,9 @@ def estimated_sharpe_ratio_stdev(returns: Union[np.ndarray, pd.Series, pd.DataFr
     if sr is None:
         sr = ann_estimated_sharpe_ratio(returns, 365)
 
-    sr_std = np.sqrt((1 + (0.5 * sr ** 2) - (skewness * sr) + (((kurt - 3) / 4) * sr ** 2)) / (n - 1))
+    sr_std = np.sqrt(
+        (1 + (0.5 * sr**2) - (skewness * sr) + (((kurt - 3) / 4) * sr**2)) / (n - 1)
+    )
 
     if type(returns) == pd.DataFrame:
         sr_std = pd.Series(sr_std, index=returns.columns)
@@ -543,10 +618,12 @@ def estimated_sharpe_ratio_stdev(returns: Union[np.ndarray, pd.Series, pd.DataFr
     return sr_std
 
 
-def probabilistic_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None, sr_benchmark: float = 0.0,
-                               sr: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None,
-                               sr_std: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None) -> Union[
-    float, pd.Series]:
+def probabilistic_sharpe_ratio(
+    returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None,
+    sr_benchmark: float = 0.0,
+    sr: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None,
+    sr_std: Union[float, np.ndarray, pd.Series, pd.DataFrame] = None,
+) -> Union[float, pd.Series]:
     """
     Calculate the Probabilistic Sharpe Ratio (PSR).
 
@@ -574,9 +651,14 @@ def probabilistic_sharpe_ratio(returns: Union[np.ndarray, pd.Series, pd.DataFram
     return psr
 
 
-def min_track_record_length(returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None, sr_benchmark: float = 0.0,
-                            prob: float = 0.95, n: int = None, sr: float = None, sr_std: float = None) -> Union[
-    float, pd.Series]:
+def min_track_record_length(
+    returns: Union[np.ndarray, pd.Series, pd.DataFrame] = None,
+    sr_benchmark: float = 0.0,
+    prob: float = 0.95,
+    n: int = None,
+    sr: float = None,
+    sr_std: float = None,
+) -> Union[float, pd.Series]:
     """
     Calculate the Minimum Track Record Length (minTRL).
 
@@ -598,7 +680,7 @@ def min_track_record_length(returns: Union[np.ndarray, pd.Series, pd.DataFrame] 
     if sr_std is None:
         sr_std = estimated_sharpe_ratio_stdev(returns, sr=sr)
 
-    min_trl = 1 + (sr_std ** 2 * (n - 1)) * (norm.ppf(prob) / (sr - sr_benchmark)) ** 2
+    min_trl = 1 + (sr_std**2 * (n - 1)) * (norm.ppf(prob) / (sr - sr_benchmark)) ** 2
 
     if type(returns) == pd.DataFrame:
         min_trl = pd.Series(min_trl, index=returns.columns)
@@ -608,7 +690,9 @@ def min_track_record_length(returns: Union[np.ndarray, pd.Series, pd.DataFrame] 
     return min_trl
 
 
-def num_independent_trials(trials_returns: pd.DataFrame = None, m: int = None, p: float = None) -> int:
+def num_independent_trials(
+    trials_returns: pd.DataFrame = None, m: int = None, p: float = None
+) -> int:
     """
     Calculate the number of independent trials.
 
@@ -631,8 +715,12 @@ def num_independent_trials(trials_returns: pd.DataFrame = None, m: int = None, p
     return int(n) + 1
 
 
-def expected_maximum_sr(trials_returns: pd.DataFrame = None, expected_mean_sr: float = 0.0,
-                        independent_trials: int = None, trials_sr_std: float = None) -> float:
+def expected_maximum_sr(
+    trials_returns: pd.DataFrame = None,
+    expected_mean_sr: float = 0.0,
+    independent_trials: int = None,
+    trials_sr_std: float = None,
+) -> float:
     """
     Calculate the expected maximum Sharpe ratio.
 
@@ -653,12 +741,18 @@ def expected_maximum_sr(trials_returns: pd.DataFrame = None, expected_mean_sr: f
     if trials_sr_std is None:
         trials_sr_std = estimated_sharpe_ratio(trials_returns).std()
 
-    maxZ = (1 - emc) * norm.ppf(1 - 1. / independent_trials) + emc * norm.ppf(1 - 1. / (independent_trials * np.e))
+    maxZ = (1 - emc) * norm.ppf(1 - 1.0 / independent_trials) + emc * norm.ppf(
+        1 - 1.0 / (independent_trials * np.e)
+    )
     return expected_mean_sr + (trials_sr_std * maxZ)
 
 
-def deflated_sharpe_ratio(trials_returns: pd.DataFrame = None, returns_selected: pd.DataFrame = None,
-                          expected_mean_sr: float = 0.0, expected_max_sr: float = None) -> float:
+def deflated_sharpe_ratio(
+    trials_returns: pd.DataFrame = None,
+    returns_selected: pd.DataFrame = None,
+    expected_mean_sr: float = 0.0,
+    expected_max_sr: float = None,
+) -> float:
     """
     Calculate the Deflated Sharpe Ratio (DSR).
 
@@ -673,8 +767,10 @@ def deflated_sharpe_ratio(trials_returns: pd.DataFrame = None, returns_selected:
     """
     if expected_max_sr is None:
         expected_max_sr = expected_maximum_sr(trials_returns, expected_mean_sr)
-        logging.info('Maximum expected daily sharpe: %f', expected_max_sr)
-    return probabilistic_sharpe_ratio(returns=returns_selected, sr_benchmark=expected_max_sr)
+        logging.info("Maximum expected daily sharpe: %f", expected_max_sr)
+    return probabilistic_sharpe_ratio(
+        returns=returns_selected, sr_benchmark=expected_max_sr
+    )
 
 
 def select_best_sr_strategies(df: pd.DataFrame, N: int) -> pd.DataFrame:
@@ -694,8 +790,9 @@ def select_best_sr_strategies(df: pd.DataFrame, N: int) -> pd.DataFrame:
     return df[top_strategies]
 
 
-def comb_k_fold_cv_grouped(n_splits: int, n_test_splits: int, data_length: int) -> Iterable[
-    Tuple[List[np.ndarray], List[np.ndarray]]]:
+def comb_k_fold_cv_grouped(
+    n_splits: int, n_test_splits: int, data_length: int
+) -> Iterable[Tuple[List[np.ndarray], List[np.ndarray]]]:
     """
     Generate grouped indices for combinatorial K-Fold Cross Validation.
 
@@ -709,13 +806,15 @@ def comb_k_fold_cv_grouped(n_splits: int, n_test_splits: int, data_length: int) 
     """
     indices = np.arange(data_length)
     fold_size = data_length // n_splits
-    folds = [indices[i * fold_size: (i + 1) * fold_size] for i in range(n_splits)]
+    folds = [indices[i * fold_size : (i + 1) * fold_size] for i in range(n_splits)]
 
     for test_fold_indices in combinations(range(n_splits), n_test_splits):
         test_indices = np.hstack([folds[i] for i in test_fold_indices])
         train_indices = np.setdiff1d(indices, test_indices)
 
-        grouped_train_indices = np.split(train_indices, np.where(np.diff(train_indices) != 1)[0] + 1)
+        grouped_train_indices = np.split(
+            train_indices, np.where(np.diff(train_indices) != 1)[0] + 1
+        )
         grouped_test_indices = [folds[i] for i in test_fold_indices]
 
         yield grouped_train_indices, grouped_test_indices
@@ -735,37 +834,57 @@ def run_stress_tests(returns: pd.DataFrame, params: Dict[str, Any] = None) -> No
     if params is None:
         params = {}
 
-    pbo_splits = params.get('pbo_splits', 10)
-    annual_benchmark_sharpe = params.get('annual_benchmark_sharpe', 1)
-    top_n_strategies = params.get('top_n_strategies', 5)
+    pbo_splits = params.get("pbo_splits", 10)
+    annual_benchmark_sharpe = params.get("annual_benchmark_sharpe", 1)
+    top_n_strategies = params.get("top_n_strategies", 5)
 
     returns = returns.T.drop_duplicates().T
     returns.columns = range(len(returns.columns))
-    returns = returns.drop([col for col in returns.columns if returns[col].nunique() == 1], axis=1)
+    returns = returns.drop(
+        [col for col in returns.columns if returns[col].nunique() == 1], axis=1
+    )
 
-    logging.info('---')
+    logging.info("---")
     pbo(np.array(returns), pbo_splits)
-    logging.info('---')
+    logging.info("---")
 
     daily_benchmark_sharpe = annual_benchmark_sharpe / np.sqrt(365)
-    logging.info('Daily benchmark Sharpe: %f', daily_benchmark_sharpe)
+    logging.info("Daily benchmark Sharpe: %f", daily_benchmark_sharpe)
 
     top_strategies = select_best_sr_strategies(returns, top_n_strategies)
     for col in top_strategies.columns:
-        logging.info('Strategy %s annual sharpe: %f', col, annual_sharpe(top_strategies.loc[:, col]))
-        logging.info('Strategy %s daily sharpe: %f', col, estimated_sharpe_ratio(top_strategies.loc[:, col]))
-    logging.info('---')
+        logging.info(
+            "Strategy %s annual sharpe: %f",
+            col,
+            annual_sharpe(top_strategies.loc[:, col]),
+        )
+        logging.info(
+            "Strategy %s daily sharpe: %f",
+            col,
+            estimated_sharpe_ratio(top_strategies.loc[:, col]),
+        )
+    logging.info("---")
 
-    logging.info('Probabilistic sharpe - chances that top %d will show sharpe higher than %f', top_n_strategies,
-                 annual_benchmark_sharpe)
-    logging.info('Probabilistic sharpe v1')
+    logging.info(
+        "Probabilistic sharpe - chances that top %d will show sharpe higher than %f",
+        top_n_strategies,
+        annual_benchmark_sharpe,
+    )
+    logging.info("Probabilistic sharpe v1")
     logging.info(calculate_psr(top_strategies, daily_benchmark_sharpe))
-    logging.info('Probabilistic sharpe v2')
-    logging.info(probabilistic_sharpe_ratio(top_strategies, sr_benchmark=daily_benchmark_sharpe))
-    logging.info('---')
+    logging.info("Probabilistic sharpe v2")
+    logging.info(
+        probabilistic_sharpe_ratio(top_strategies, sr_benchmark=daily_benchmark_sharpe)
+    )
+    logging.info("---")
 
-    logging.info('Deflated sharpe')
+    logging.info("Deflated sharpe")
     logging.info(calculate_dsr(returns, top_strategies))
-    logging.info('Deflated sharpe v2')
-    logging.info(deflated_sharpe_ratio(trials_returns=returns, returns_selected=top_strategies,
-                                       expected_mean_sr=daily_benchmark_sharpe))
+    logging.info("Deflated sharpe v2")
+    logging.info(
+        deflated_sharpe_ratio(
+            trials_returns=returns,
+            returns_selected=top_strategies,
+            expected_mean_sr=daily_benchmark_sharpe,
+        )
+    )
