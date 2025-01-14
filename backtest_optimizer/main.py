@@ -491,7 +491,7 @@ class ParameterOptimizer:
                 group_indices[i][ticker] = idx  # Store indices instead of DataFrames
         return group_indices
 
-    def plot_returns(self, data_dict, params: dict):
+    def plot_returns(self, data_dict, params: dict, save_returns=False):
         """
         Calculate out-of-sample Sharpe ratio and plot cumulative returns.
 
@@ -530,9 +530,24 @@ class ParameterOptimizer:
         returns = self.calc_pl(data_dict, params)
 
         if isinstance(returns, pd.Series):
+            if save_returns:
+                returns.to_csv(self.save_path + self.file_prefix + "_returns.csv")
+                logging.info(
+                    f"Returns saved as {self.save_path + self.file_prefix + '_returns.csv'}"
+                )
             plot_results(returns, self.file_prefix + "total_returns.png")
         elif isinstance(returns, dict):
             for returns_type, returns_series in returns.items():
+                if save_returns:
+                    returns_series.to_csv(
+                        self.save_path
+                        + self.file_prefix
+                        + f"_{returns_type}"
+                        + "_returns.csv",
+                    )
+                    logging.info(
+                        f"Returns saved as {self.save_path + self.file_prefix + returns_type + '_returns.csv'}"
+                    )
                 plot_results(
                     returns_series, self.file_prefix + f"{returns_type}_returns.png"
                 )
