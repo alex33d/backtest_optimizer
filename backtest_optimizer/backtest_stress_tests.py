@@ -664,7 +664,7 @@ def min_track_record_length(
 
     Args:
         returns (Union[np.ndarray, pd.Series, pd.DataFrame], optional): Returns data.
-        sr_benchmark (float): Benchmark Sharpe ratio.
+        sr_benchmark (float): Benchmark annual Sharpe ratio (which will be converted to daily unit)
         prob (float): Confidence level.
         n (int, optional): Number of return samples.
         sr (float, optional): Sharpe ratio.
@@ -673,6 +673,9 @@ def min_track_record_length(
     Returns:
         Union[float, pd.Series]: The minTRL value.
     """
+
+    sr_benchmark = sr_benchmark / np.sqrt(365)
+
     if n is None:
         n = len(returns)
     if sr is None:
