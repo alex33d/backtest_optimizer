@@ -30,7 +30,6 @@ import logging
 import itertools as itt
 import gc
 
-from metrics import *
 from backtest_stress_tests import run_stress_tests
 
 

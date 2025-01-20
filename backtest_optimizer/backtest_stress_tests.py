@@ -10,7 +10,7 @@ from scipy.special import logit
 from scipy.stats import norm, skew, kurtosis
 from joblib import Parallel, delayed
 from statsmodels.distributions.empirical_distribution import ECDF
-from .metrics import *
+from metrics import *
 
 try:
     matplotlib.use("TkAgg")
