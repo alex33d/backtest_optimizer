@@ -31,6 +31,7 @@ import itertools as itt
 import gc
 
 from backtest_stress_tests import run_stress_tests
+from metrics import *
 
 
 class RepeatPruner(BasePruner):
