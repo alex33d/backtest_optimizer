@@ -891,3 +891,144 @@ def run_stress_tests(returns: pd.DataFrame, params: Dict[str, Any] = None) -> No
             expected_mean_sr=daily_benchmark_sharpe,
         )
     )
+
+
+def rolling_sharpe_threshold(returns, window=126, threshold_sr=0.0):
+    """
+    Rolling test if Sharpe < threshold_sr. We do:
+      H0: Sharpe == threshold_sr vs H1: Sharpe < threshold_sr
+    or equivalently we can rewrite as testing mean - threshold_sr*(std dev) < 0.
+
+    For simplicity, let's do a direct approach:
+      - Compute sample mean, sample stdev in the window
+      - Estimate NW standard error of the mean (we must decide how to incorporate the 'threshold_sr' factor).
+      - Then form a test statistic:
+          T = (Sharpe - threshold_sr) / SE_of_Sharpe
+      - We'll produce the rolling Sharpe and also the "Sharpe threshold" needed for significance if you want to see it.
+
+    This function returns a DataFrame with:
+      'rolling_sharpe' : the rolling Sharpe
+      'test_stat'      : t-like statistic for H1: SR < threshold_sr
+      'pval'           : one-sided p-value for SR < threshold_sr
+    """
+    s_values = []
+    t_values = []
+    p_values = []
+    p_values_alt = []
+    idx = returns.index
+
+    for i in range(len(returns)):
+        if i < window:
+            s_values.append(np.nan)
+            t_values.append(np.nan)
+            p_values.append(np.nan)
+            p_values_alt.append(np.nan)
+        else:
+            window_data = returns.iloc[i - window : i]
+            r = window_data.values
+
+            # sample mean, stdev
+            mu = np.mean(r)
+            sigma = np.std(r, ddof=1)
+            # naive Sharpe
+            sample_sr = mu / sigma
+
+            # Alternative approach
+            pval = probabilistic_sharpe_ratio(window_data, sr_benchmark=threshold_sr)
+
+            s_values.append(sample_sr)
+            p_values.append(pval)
+
+    print(len(p_values), len(p_values_alt))
+    df_out = pd.DataFrame(
+        {
+            "rolling_sharpe": s_values,
+            "pval": p_values,
+        },
+        index=idx,
+    )
+    return df_out
+
+
+def cusum_breaks(returns, h=0.01):
+    """
+    A simplistic CUSUM approach to detect structural breaks in the mean.
+    h: threshold for detection (depends on scale of data).
+
+    Returns a list of break indices.
+    """
+    s = 0
+    indices = []
+    for i in range(1, len(returns)):
+        s = s + (returns.iloc[i] - returns.iloc[i - 1])
+        if abs(s) > h:
+            indices.append(returns.index[i])
+            s = 0  # reset
+    return indices
+
+
+###############################################################################
+# 2) Demo / Putting It All Together
+###############################################################################
+
+
+def plot_rolling_sharpe(returns, sharpe_threshold=1, window=180, alpha=0.1):
+    daily_sharpe_threshold = round(1 / np.sqrt(365), 3)
+
+    if isinstance(returns, pd.Series):
+        returns_ser = returns
+    elif isinstance(returns, pd.DataFrame):
+        returns_ser = returns.iloc[:, 0]
+    else:
+        raise Exception("Supported returns format are Series or DataFrame")
+
+    # 2) Rolling Sharpe test if SR < threshold (e.g., 0 or 1)
+    # Here let's test if SR < 0. We'll produce a DataFrame
+    df_sharpe_test = rolling_sharpe_threshold(
+        returns_ser, window=window, threshold_sr=daily_sharpe_threshold
+    )
+
+    # Prepare data for plotting
+    cumret = returns_ser.cumsum()
+
+    ############################################################################
+    # Plot the requested subplots
+    ############################################################################
+    fig, axes = plt.subplots(3, 1, figsize=(12, 14), sharex=True)
+
+    # (1) Cumulative returns with breakpoints
+    axes[0].plot(cumret, label="Cumulative Returns")
+    axes[0].legend()
+
+    # (2) Alpha statistics p-values
+    # axes[1].plot(rolling_pvals, label='Rolling p-value (alpha>0)')
+    # axes[1].axhline(0.05, color='r', linestyle='--', label='5% cutoff')
+    # axes[1].set_ylim([0, 1])
+    # axes[1].set_title("Rolling Alpha p-values (Newey-West, window=60)")
+    # axes[1].legend()
+
+    # (3) Rolling Sharpe with threshold
+    axes[1].plot(
+        df_sharpe_test["rolling_sharpe"] * np.sqrt(365), label="Rolling Sharpe"
+    )
+    # We can plot lines for "Sharpe = 0" if we want
+    axes[1].axhline(
+        sharpe_threshold,
+        color="r",
+        linestyle="--",
+        label=f"SR={sharpe_threshold} threshold",
+    )
+    axes[1].set_title(
+        f"Rolling Sharpe, Testing SR < {sharpe_threshold} with NW adjustment"
+    )
+    axes[1].legend()
+
+    # (4) Sharpe test p-values
+    axes[2].plot(df_sharpe_test["pval"], label=f"p-value (SR < {sharpe_threshold})")
+    axes[2].axhline(alpha, color="r", linestyle="--", label=f"{alpha} cutoff")
+    axes[2].set_ylim([0, 1])
+    axes[2].set_title("Rolling Sharpe Test p-values (one-sided)")
+    axes[2].legend()
+
+    plt.tight_layout()
+    plt.show()

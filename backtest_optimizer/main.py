@@ -620,6 +620,7 @@ class ParameterOptimizer:
 
     def optimize(
         self,
+        data_dict: {},
         n_splits: int,
         n_test_splits: int,
         params: dict,
@@ -639,7 +640,8 @@ class ParameterOptimizer:
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
-        data_dict = self.load_data_from_parquet("train")
+        if not data_dict:
+            data_dict = self.load_data_from_parquet("train")
 
         self.create_combcv_dict(
             data_dict, n_splits=n_splits, n_test_splits=n_test_splits
