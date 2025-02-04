@@ -865,7 +865,7 @@ class ParameterOptimizer:
         return wcss
 
     def find_optimal_clusters(
-        self, param_matrix_scaled: np.ndarray, max_clusters: int
+        self, param_matrix_scaled: np.ndarray, max_clusters: int, plot_elbow=False
     ) -> int:
         """
         Find the optimal number of clusters using the elbow method.
@@ -883,17 +883,18 @@ class ParameterOptimizer:
         second_derivative = np.diff(first_derivative)
         elbow_point = np.argmin(second_derivative) + 2  # +2 to correct the index offset
 
-        plt.figure(figsize=(10, 7))
-        plt.plot(range(1, max_clusters + 1), wcss, marker="o")
-        plt.axvline(x=elbow_point, color="r", linestyle="--")
-        plt.title("Elbow Method")
-        plt.xlabel("Number of Clusters")
-        plt.ylabel("WCSS")
-        plt.show()
+        if plot_elbow:
+            plt.figure(figsize=(10, 7))
+            plt.plot(range(1, max_clusters + 1), wcss, marker="o")
+            plt.axvline(x=elbow_point, color="r", linestyle="--")
+            plt.title("Elbow Method")
+            plt.xlabel("Number of Clusters")
+            plt.ylabel("WCSS")
+            plt.show()
 
         return elbow_point
 
-    def cluster_and_aggregate(self, min_sharpe=None) -> dict:
+    def cluster_and_aggregate(self, min_sharpe=None, plot_elbow=False) -> dict:
         """
         Cluster parameter sets and aggregate the best parameters.
 
@@ -915,6 +916,12 @@ class ParameterOptimizer:
 
         if min_sharpe:
             param_df = param_df[param_df["sharpe"] > min_sharpe]
+            if param_df.empty:
+                logging.warning(
+                    f"None of parameters generated sharpe above {min_sharpe}"
+                )
+                return {}
+
         param_df = param_df.drop(columns=["sharpe"]).dropna(axis=1)
 
         max_clusters = min(max(3, len(param_df) // 3), len(param_df))
@@ -941,7 +948,9 @@ class ParameterOptimizer:
 
             param_matrix_scaled = column_transformer.fit_transform(param_df)
             best_n_clusters = (
-                self.find_optimal_clusters(param_matrix_scaled, max_clusters)
+                self.find_optimal_clusters(
+                    param_matrix_scaled, max_clusters, plot_elbow=plot_elbow
+                )
                 if max_clusters < len(param_df)
                 else max_clusters
             )
