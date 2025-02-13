@@ -1280,8 +1280,8 @@ def process_combination(
         metrics = calculate_metrics(returns)
 
         return {"params": param_set, "returns": returns, "metrics": metrics}
-    except Exception as e:
-        logging.error(f"Error processing combination {param_set}: {str(e)}")
+    except Exception:
+        logging.error(f"Error processing combination {param_set}", exc_info=True)
         return None
 
 
