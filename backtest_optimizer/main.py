@@ -648,7 +648,6 @@ class ParameterOptimizer:
         params: dict,
         n_runs: int,
         best_trials_pct: float,
-        ram_saving_mode: bool = False,
     ):
         """
         Optimize parameters using Optuna.
@@ -667,6 +666,8 @@ class ParameterOptimizer:
         self.create_combcv_dict(
             data_dict, n_splits=n_splits, n_test_splits=n_test_splits
         )
+
+        ram_saving_mode = params.get("ram_saving_mode", False)
 
         if ram_saving_mode:
             data_dict = {}
