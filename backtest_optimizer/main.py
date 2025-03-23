@@ -71,8 +71,12 @@ def calc_returns(args):
     return returns
 
 
-def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
-    """Create a standalone objective function that doesn't rely on instance variables."""
+def create_objective(
+    group_indices, params_dict, calc_pl_func, data_source, ram_saving_mode: bool = False
+):
+    """
+    Create an objective function that passes the mode flag and data_source to combcv_pl.
+    """
 
     def objective(trial):
         try:
@@ -80,13 +84,8 @@ def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
             for k, v in params_dict.items():
                 if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
                     trial_params[k] = v
-                elif all(isinstance(item, int) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
-                elif any(isinstance(item, float) for item in v):
-                    trial_params[k] = trial.suggest_categorical(k, v)
                 else:
                     trial_params[k] = trial.suggest_categorical(k, v)
-
             current_params = trial.params
             existing_trials = trial.study.get_trials(deepcopy=False)
             completed_trials = [
@@ -100,39 +99,67 @@ def create_objective(group_indices, params_dict, calc_pl_func, data_dict):
                     f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
                 )
                 raise optuna.TrialPruned()
-
-            sharpe, _ = combcv_pl(trial_params, group_indices, calc_pl_func, data_dict)
-
+            sharpe, _ = combcv_pl(
+                trial_params,
+                group_indices,
+                calc_pl_func,
+                data_source,
+                ram_saving_mode=ram_saving_mode,
+            )
             if np.isnan(sharpe):
                 logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
                 return -1e6
-
             return sharpe
-
         except optuna.TrialPruned:
-            raise  # Allow Optuna to handle pruning
+            raise
         except Exception as e:
-            logging.exception(f"Error in trial {trial.number}")
-            return -1e6  # Assign a large negative penalty
+            logging.exception(f"Error in trial {trial.number}: {e}")
+            return -1e6
 
     return objective
 
 
 def combcv_pl(
-    params: dict, group_indices: dict, calc_pl_func: callable, data_dict: dict
+    params: dict,
+    group_indices: dict,
+    calc_pl_func: callable,
+    data_source: dict,
+    ram_saving_mode: bool = False,
 ) -> tuple:
+    """
+    For each CV group in group_indices, aggregate returns.
+
+    In original mode (ram_saving_mode=False), data_source is assumed to be a dictionary mapping
+    tickers to DataFrames, and the function extracts the slices directly.
+
+    In RAM‑saving mode (ram_saving_mode=True), data_source is assumed to be a mapping from ticker
+    to (for example) a file path. In that case, this function simply passes a dictionary mapping
+    {ticker: indices to analyze} to calc_pl_func, which must load the ticker data on demand.
+
+    Returns:
+        (final_sharpe, final_returns) where final_returns is a list (one per group) of aggregated returns.
+    """
+
     final_returns = []
     for group_num, ticker_indices in group_indices.items():
         group_data = {}
         for ticker, indices in ticker_indices.items():
-            df = data_dict.get(ticker)
-            if df is None or df.empty:
-                logging.warning(f"Ticker {ticker} has no data for group {group_num}.")
-                continue
-            group_data[ticker] = df.iloc[indices]
+            if not ram_saving_mode:
+                df = data_source.get(ticker)
+                if df is None or df.empty:
+                    logging.warning(
+                        f"Ticker {ticker} has no data for group {group_num}."
+                    )
+                    continue
+                group_data[ticker] = df.iloc[indices]
+            else:
+                # In RAM‑saving mode, simply pass the indices for each ticker.
+                group_data[ticker] = indices
         if not group_data:
             logging.warning(f"No valid tickers in group {group_num}. Skipping.")
             continue
+
+        # Note: calc_pl_func must be aware of the mode via the ram_saving_mode flag.
         returns = calc_pl_func(group_data, params)
         if returns is None or returns.empty:
             logging.warning(
@@ -141,22 +168,17 @@ def combcv_pl(
             continue
         final_returns.append(returns)
 
-    if not final_returns:
-        logging.error("All groups returned empty or invalid returns.")
-        return np.nan, final_returns  # Return NaN to indicate failure
-
+    # Compute Sharpe ratios from each group's aggregated returns.
     sharpe_ratios = []
     for r in final_returns:
         sharpe = annual_sharpe(r)
         if np.isnan(sharpe):
-            logging.warning("Annual Sharpe ratio calculated as NaN.")
+            logging.warning("Annual Sharpe ratio calculated as NaN for a group.")
             continue
         sharpe_ratios.append(sharpe)
-
     if not sharpe_ratios:
         logging.error("All Sharpe ratios are NaN.")
         return np.nan, final_returns
-
     final_sharpe = np.nanmean(sharpe_ratios)
     return final_sharpe, final_returns
 
@@ -620,12 +642,13 @@ class ParameterOptimizer:
 
     def optimize(
         self,
-        data_dict: {},
+        data_dict: dict,
         n_splits: int,
         n_test_splits: int,
         params: dict,
         n_runs: int,
         best_trials_pct: float,
+        ram_saving_mode: bool = False,
     ):
         """
         Optimize parameters using Optuna.
@@ -640,12 +663,16 @@ class ParameterOptimizer:
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
-        if not data_dict:
-            data_dict = self.load_data_from_parquet("train")
 
         self.create_combcv_dict(
             data_dict, n_splits=n_splits, n_test_splits=n_test_splits
         )
+
+        if ram_saving_mode:
+            data_dict = {}
+            self.params_dict["data_path"] = os.path.join(
+                self.save_path, f"{self.file_prefix}_train_data"
+            )
 
         # Create the objective function closure
         for fold_num, train_test_splits in self.combcv_dict.items():
@@ -657,7 +684,11 @@ class ParameterOptimizer:
 
             # Pass calc_pl and data_dict explicitly
             objective_func = create_objective(
-                group_indices, self.params_dict, self.calc_pl, data_dict
+                group_indices,
+                self.params_dict,
+                self.calc_pl,
+                data_dict,
+                ram_saving_mode=ram_saving_mode,
             )
 
             study = optuna.create_study(
@@ -691,7 +722,8 @@ class ParameterOptimizer:
                     params=trial_params,
                     group_indices=group_indices,
                     calc_pl_func=self.calc_pl,
-                    data_dict=data_dict,
+                    data_source=data_dict,
+                    ram_saving_mode=ram_saving_mode,
                 )
                 if i == 0:
                     trial_params["fold_num"] = fold_num
@@ -713,6 +745,10 @@ class ParameterOptimizer:
                 param_df = pd.DataFrame(self.top_params_list).sort_values(
                     "sharpe", ascending=False
                 )
+
+                if "data_path" in param_df.columns:
+                    del param_df["data_path"]
+
                 param_df.to_csv(
                     self.save_path + self.file_prefix + "top_params.csv", index=False
                 )
