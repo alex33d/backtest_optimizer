@@ -53,9 +53,11 @@ class RepeatPruner(BasePruner):
             t for t in trials if t.state == optuna.trial.TrialState.COMPLETE
         ]
         params_list = [t.params for t in completed_trials]
-        
+
         if trial.params in params_list:
-            logging.info(f"Trial {trial.number} pruned due to duplicate parameters: {trial.params}")
+            logging.info(
+                f"Trial {trial.number} pruned due to duplicate parameters: {trial.params}"
+            )
             return True
         return False
 
@@ -75,7 +77,6 @@ def calc_returns(args):
 
 
 class ParameterOptimizer:
-
     def __init__(
         self, calc_pl: callable, save_path: str, save_file_prefix: str, n_jobs: int
     ):
@@ -102,6 +103,7 @@ class ParameterOptimizer:
         self.data_info = {}  # Store metadata about data files (lengths, etc.)
         self._file_cache = {}  # Cache for loaded files
         self._cache_size_limit = 10  # Maximum number of files to keep in cache
+        self.average_row_size_bytes = None
 
     def combcv_pl(
         self,
@@ -121,14 +123,14 @@ class ParameterOptimizer:
             (final_sharpe, final_returns) where final_returns is a list (one per group) of aggregated returns.
         """
         final_returns = []
-        
+
         logging.info(f"Processing {len(group_indices)} groups with params: {params}")
-        
+
         for group_num, ticker_indices in group_indices.items():
             ticker_count = len(ticker_indices)
             logging.info(f"Processing group {group_num} with {ticker_count} tickers")
             group_data = {}
-            
+
             for ticker, indices in ticker_indices.items():
                 if isinstance(data_source, str):
                     # Load data from directory for specific date ranges
@@ -137,75 +139,86 @@ class ParameterOptimizer:
                     if not df.empty:
                         group_data[ticker] = df
                     else:
-                        logging.warning(f"Group {group_num}: Got empty DataFrame for {ticker}")
+                        logging.warning(
+                            f"Group {group_num}: Got empty DataFrame for {ticker}"
+                        )
                 else:
                     # Legacy mode - data already in memory
                     df = data_source.get(ticker)
                     if df is None or df.empty:
-                        logging.warning(f"Group {group_num}: Ticker {ticker} has no data")
+                        logging.warning(
+                            f"Group {group_num}: Ticker {ticker} has no data"
+                        )
                         continue
-                    
+
                     if isinstance(indices, pd.DatetimeIndex):
                         # DatetimeIndex case
                         mask = df.index.isin(indices)
                         rows_count = mask.sum()
-                        logging.debug(f"Group {group_num}: Filtering {ticker} with DatetimeIndex, matched {rows_count} rows")
+                        logging.debug(
+                            f"Group {group_num}: Filtering {ticker} with DatetimeIndex, matched {rows_count} rows"
+                        )
                         group_data[ticker] = df.loc[mask]
                     else:
                         # Integer indices case (legacy)
                         group_data[ticker] = df.iloc[indices]
-                    
+
             if not group_data:
                 logging.warning(f"Group {group_num}: No valid tickers. Skipping.")
                 continue
 
             # Calculate returns for this group
-            logging.info(f"Group {group_num}: Calculating returns for {len(group_data)} tickers")
+            logging.info(
+                f"Group {group_num}: Calculating returns for {len(group_data)} tickers"
+            )
             start_time = time.time()
             returns = calc_pl_func(group_data, params)
             elapsed = time.time() - start_time
-            
+
             if returns is None or returns.empty:
-                logging.warning(f"Group {group_num}: Empty returns from calc_pl_func. Skipping.")
+                logging.warning(
+                    f"Group {group_num}: Empty returns from calc_pl_func. Skipping."
+                )
                 continue
-                
-            logging.info(f"Group {group_num}: Returns calculation completed in {elapsed:.2f}s, got {len(returns)} data points")
+
+            logging.info(
+                f"Group {group_num}: Returns calculation completed in {elapsed:.2f}s, got {len(returns)} data points"
+            )
             final_returns.append(returns)
 
         # Compute Sharpe ratios from each group's aggregated returns
         if not final_returns:
             logging.error("No valid returns from any group")
             return np.nan, final_returns
-            
+
         logging.info(f"Computing Sharpe ratios for {len(final_returns)} groups")
         sharpe_ratios = []
-        
+
         for i, r in enumerate(final_returns):
             sharpe = annual_sharpe(r)
             if np.isnan(sharpe):
                 logging.warning(f"Group {i}: Annual Sharpe ratio calculated as NaN")
                 continue
-            logging.info(f"Group {i}: Annual Sharpe = {sharpe:.4f}, from {len(r)} returns")
+            logging.info(
+                f"Group {i}: Annual Sharpe = {sharpe:.4f}, from {len(r)} returns"
+            )
             sharpe_ratios.append(sharpe)
-        
+
         if not sharpe_ratios:
             logging.error("All Sharpe ratios are NaN")
             return np.nan, final_returns
-        
+
         final_sharpe = np.nanmean(sharpe_ratios)
-        logging.info(f"Final mean Sharpe ratio: {final_sharpe:.4f} (across {len(sharpe_ratios)} groups)")
+        logging.info(
+            f"Final mean Sharpe ratio: {final_sharpe:.4f} (across {len(sharpe_ratios)} groups)"
+        )
         return final_sharpe, final_returns
 
-    def create_objective(
-        self,
-        group_indices, 
-        params_dict, 
-        calc_pl_func, 
-        data_source
-    ):
+    def create_objective(self, group_indices, params_dict, calc_pl_func, data_source):
         """
         Create an objective function that passes data_source to combcv_pl.
         """
+
         def objective(trial):
             try:
                 trial_params = {}
@@ -214,22 +227,24 @@ class ParameterOptimizer:
                         trial_params[k] = v
                     else:
                         trial_params[k] = trial.suggest_categorical(k, v)
-                
+
                 # Check for duplicate parameters
                 current_params = trial.params
                 existing_trials = trial.study.get_trials(deepcopy=False)
-                completed_trials = [t for t in existing_trials 
-                    if t.state == optuna.trial.TrialState.COMPLETE]
+                completed_trials = [
+                    t
+                    for t in existing_trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                ]
                 existing_params = [t.params for t in completed_trials]
                 if current_params in existing_params:
-                    logging.info(f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}")
+                    logging.info(
+                        f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
+                    )
                     raise optuna.TrialPruned()
-                    
+
                 sharpe, _ = self.combcv_pl(
-                    trial_params,
-                    group_indices,
-                    calc_pl_func,
-                    data_source
+                    trial_params, group_indices, calc_pl_func, data_source
                 )
                 if np.isnan(sharpe):
                     logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
@@ -250,126 +265,149 @@ class ParameterOptimizer:
             # Sort by last_accessed timestamp
             sorted_items = sorted(
                 self._file_cache.items(),
-                key=lambda x: x[1]['last_accessed'],
-                reverse=True
+                key=lambda x: x[1]["last_accessed"],
+                reverse=True,
             )
             # Keep only the top N items and clear the rest
-            keep_items = dict(sorted_items[:self._cache_size_limit])
+            keep_items = dict(sorted_items[: self._cache_size_limit])
             self._file_cache = keep_items
 
     def collect_data_info(self, data_dir: str, file_pattern: str = None):
         """
         Collect metadata about data files without loading them fully into memory.
-        
+
         Args:
             data_dir (str): Directory containing the data files
             file_pattern (str): Pattern to match data files. If None, all supported formats are used.
         """
         import glob
-        
+
         logging.info(f"Collecting data info from {data_dir}")
         self.data_info = {}
-        
+
         # Get list of all data files with supported extensions
-        supported_patterns = [
-            "*.parquet", "*.csv.gz", "*.csv"
-        ] if file_pattern is None else [file_pattern]
-        
+        supported_patterns = (
+            ["*.parquet", "*.csv.gz", "*.csv"]
+            if file_pattern is None
+            else [file_pattern]
+        )
+
         file_paths = []
         for pattern in supported_patterns:
             file_paths.extend(glob.glob(os.path.join(data_dir, pattern)))
-        
+
         for file_path in tqdm(file_paths, desc="Processing data files"):
             try:
                 filename = os.path.basename(file_path)
-                ticker = filename.split('.')[0]  # Extract ticker from filename
-                
+                ticker = filename.split(".")[0]  # Extract ticker from filename
+
                 # Read only metadata depending on file type
-                if file_path.endswith('.parquet'):
+                if file_path.endswith(".parquet"):
                     df_sample = pd.read_parquet(file_path, columns=[])
                     # Get date range from parquet metadata
-                    df_sample_start_date = df_sample.index.min() if len(df_sample) > 0 and hasattr(df_sample.index, 'min') else None
-                    df_sample_end_date = df_sample.index.max() if len(df_sample) > 0 and hasattr(df_sample.index, 'max') else None
-                    df_sample_freq = 'D'  # Default
-                    if len(df_sample) > 1 and hasattr(df_sample.index, 'inferred_freq'):
+                    df_sample_start_date = (
+                        df_sample.index.min()
+                        if len(df_sample) > 0 and hasattr(df_sample.index, "min")
+                        else None
+                    )
+                    df_sample_end_date = (
+                        df_sample.index.max()
+                        if len(df_sample) > 0 and hasattr(df_sample.index, "max")
+                        else None
+                    )
+                    df_sample_freq = "D"  # Default
+                    if len(df_sample) > 1 and hasattr(df_sample.index, "inferred_freq"):
                         inferred = pd.infer_freq(df_sample.index)
                         if inferred is not None:
                             df_sample_freq = inferred
-                elif file_path.endswith('.csv.gz') or file_path.endswith('.csv'):
+                elif file_path.endswith(".csv.gz") or file_path.endswith(".csv"):
                     # For CSV files, use efficient date range function
                     # Use the first column as the date column
-                    compression = 'gzip' if file_path.endswith('.csv.gz') else None
-                    
+                    compression = "gzip" if file_path.endswith(".csv.gz") else None
+
                     # Read just the first row to get first column name
                     try:
-                        first_row = pd.read_csv(file_path, nrows=1, compression=compression)
+                        first_row = pd.read_csv(
+                            file_path, nrows=1, compression=compression
+                        )
                         date_col = first_row.columns[0]  # Use first column as date
-                        
+
                         # Get date range and frequency
-                        df_sample_start_date, df_sample_end_date, df_sample_freq = self._get_csv_date_range(
+                        (
+                            df_sample_start_date,
+                            df_sample_end_date,
+                            df_sample_freq,
+                        ) = self._get_csv_date_range(
                             file_path, date_col=date_col, compression=compression
                         )
                     except Exception as e:
-                        logging.warning(f"Error processing first column as date in {file_path}: {str(e)}")
+                        logging.warning(
+                            f"Error processing first column as date in {file_path}: {str(e)}"
+                        )
                         continue
                 else:
                     logging.warning(f"Unsupported file format for {file_path}")
                     continue
-                
+
                 self.data_info[ticker] = {
-                    'path': file_path,
-                    'format': file_path.split('.')[-1] if not file_path.endswith('.csv.gz') else 'csv.gz',
-                    'start_date': df_sample_start_date,
-                    'end_date': df_sample_end_date,
-                    'freq': df_sample_freq,
+                    "path": file_path,
+                    "format": file_path.split(".")[-1]
+                    if not file_path.endswith(".csv.gz")
+                    else "csv.gz",
+                    "start_date": df_sample_start_date,
+                    "end_date": df_sample_end_date,
+                    "freq": df_sample_freq,
                 }
             except Exception as e:
                 logging.warning(f"Error processing {file_path}: {str(e)}")
-                
+
         logging.info(f"Collected info for {len(self.data_info)} tickers")
 
-    
     def _calculate_frequency(self, dates):
         """
         Calculate the frequency of a time series based on the most common time difference.
         Uses pandas built-in frequency detection with fallback to mode-based detection.
-        
+
         Args:
             dates (pd.DatetimeIndex or Series): Datetime values
-            
+
         Returns:
             str: Frequency string in pandas format
         """
         from pandas.tseries.frequencies import to_offset
-        
+
         # Ensure we have a DatetimeIndex
         if isinstance(dates, pd.Series):
             dates = pd.DatetimeIndex(dates)
-        
+
         # First try pandas' built-in frequency inference
         freq = dates.inferred_freq or pd.infer_freq(dates)
         if freq:
             logging.debug(f"Frequency inferred by pandas: {freq}")
             return freq
-        
+
         # Fallback: calculate the most common time difference
         if len(dates) < 2:
-            logging.debug("Not enough data points to determine frequency, using default 'D'")
-            return 'D'
-        
+            logging.debug(
+                "Not enough data points to determine frequency, using default 'D'"
+            )
+            return "D"
+
         try:
             # Get the mode (most common) of time differences
             td = dates.to_series().diff().dropna().mode().iloc[0]
             freq_str = to_offset(td).freqstr
-            
+
             if freq_str:
-                logging.debug(f"Frequency determined from mode of time differences: {freq_str}")
+                logging.debug(
+                    f"Frequency determined from mode of time differences: {freq_str}"
+                )
                 return freq_str
-            
+
             # If to_offset can't determine a frequency string, convert to seconds
             total_seconds = td.total_seconds()
             logging.debug(f"Using total seconds ({total_seconds}) as frequency")
-            
+
             # Format based on the time scale
             if total_seconds < 60:
                 return f"{int(total_seconds)}S"
@@ -382,11 +420,10 @@ class ParameterOptimizer:
             else:
                 days = int(total_seconds / 86400)
                 return f"{days}D"
-                
+
         except Exception as e:
             logging.warning(f"Error determining frequency: {str(e)}. Using default 'D'")
-            return 'D'
-
+            return "D"
 
     def create_combcv_dict_old(self, data_dict, n_splits: int, n_test_splits: int):
         """
@@ -428,7 +465,6 @@ class ParameterOptimizer:
                 f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
             )
             for ticker, df in data_dict.items():
-
                 if len(df) > total_comb * 50:
                     data_length = len(df)
                     is_test, paths, path_folds = self.cpcv_generator(
@@ -450,16 +486,18 @@ class ParameterOptimizer:
                             "test": test_indices,
                         }
 
-    def _get_csv_date_range(self, filepath, date_col='date', chunksize=100_000, compression=None):
+    def _get_csv_date_range(
+        self, filepath, date_col="date", chunksize=100_000, compression=None
+    ):
         """
         Efficiently get the date range and frequency of a CSV file by reading only the date column in chunks.
-        
+
         Args:
             filepath (str): Path to the CSV file
             date_col (str): Name of the date column (not used if first column is assumed to be date)
             chunksize (int): Size of chunks to read
             compression (str): Compression type (None, 'gzip', etc.)
-            
+
         Returns:
             tuple: (start_date, end_date, frequency) as (Timestamp, Timestamp, str)
         """
@@ -469,7 +507,7 @@ class ParameterOptimizer:
             # Use the first column as the date column
             date_col = first_row.columns[0]
             logging.debug(f"Using column '{date_col}' as date column for {filepath}")
-            
+
             # First read the entire date column to get accurate start and end dates
             date_series = pd.read_csv(
                 filepath,
@@ -477,74 +515,54 @@ class ParameterOptimizer:
                 parse_dates=[date_col],
                 compression=compression,
             )[date_col]
-            
+
             # Get min and max dates
             start = pd.to_datetime(date_series.min())
             end = pd.to_datetime(date_series.max())
             logging.debug(f"Date range for {filepath}: {start} to {end}")
-            
+
             # Sort the dates and calculate frequency using custom function
             sorted_dates = date_series.sort_values()
-            
+
             freq = self._calculate_frequency(sorted_dates)
             logging.debug(f"Calculated frequency for {filepath}: {freq}")
-            
+
             return start, end, freq
         except Exception as e:
             logging.warning(f"Error getting date range for {filepath}: {str(e)}")
-            return None, None, 'D'  # Default to daily frequency on error
+            return None, None, "D"  # Default to daily frequency on error
 
     def load_ticker_data(self, ticker: str, date_range=None, data_dir=None):
-        """
-        Load data for a specific ticker, optionally within a specified date range.
-        Uses caching to avoid repeated file reads.
-        
-        Note: For loading multiple tickers in parallel, use load_multiple_tickers() instead.
-        
-        Args:
-            ticker (str): Ticker symbol
-            date_range (tuple or DatetimeIndex, optional): Date range to filter data.
-                If None, loads all data.
-            data_dir (str, optional): Directory to load data from.
-                If provided, overrides self.data_info path.
-            
-        Returns:
-            pd.DataFrame: DataFrame for the ticker with DatetimeIndex
-        """
         # If we're loading from a directory that's not in data_info
         if data_dir is not None:
-            # Handle data directory path provided directly
             file_path = None
             file_format = None
-            
-            # Check for different file formats
-            extensions = ['.parquet', '.csv', '.csv.gz']
+            extensions = [".parquet", ".csv", ".csv.gz", ".h5"]
             for ext in extensions:
                 possible_path = os.path.join(data_dir, f"{ticker}{ext}")
                 if os.path.exists(possible_path):
                     file_path = possible_path
-                    file_format = ext.lstrip('.')
+                    file_format = ext.lstrip(".")
                     break
-            
+
             if file_path is None:
                 logging.debug(f"No data file found for {ticker} in {data_dir}")
                 return pd.DataFrame()
         else:
-            # Use data_info registry
             if ticker not in self.data_info:
                 logging.debug(f"No info for ticker {ticker}")
                 return pd.DataFrame()
-                
-            file_path = self.data_info[ticker]['path']
-            file_format = self.data_info[ticker]['format']
-        
-        # Log date range information (once at this level only)
+            file_path = self.data_info[ticker]["path"]
+            file_format = self.data_info[ticker]["format"]
+
         date_range_str = "all data"
         if date_range is not None:
             if isinstance(date_range, pd.DatetimeIndex):
                 if len(date_range) > 0:
                     date_range_str = f"{date_range[0]} to {date_range[-1]}"
-                    logging.debug(f"Loading {ticker} with DatetimeIndex range: {date_range_str}")
+                    logging.debug(
+                        f"Loading {ticker} with DatetimeIndex range: {date_range_str}"
+                    )
                 else:
                     logging.debug(f"Empty DatetimeIndex provided for {ticker}")
                     return pd.DataFrame()
@@ -553,80 +571,105 @@ class ParameterOptimizer:
                 logging.debug(f"Loading {ticker} with date range: {date_range_str}")
         else:
             logging.debug(f"Loading all data for {ticker}")
-        
-        # Check if the file is already in cache
+
         if file_path in self._file_cache:
-            # Update last access timestamp
-            self._file_cache[file_path]['last_accessed'] = time.time()
-            df = self._file_cache[file_path]['data']
+            self._file_cache[file_path]["last_accessed"] = time.time()
+            df = self._file_cache[file_path]["data"]
             logging.debug(f"Retrieved {ticker} from cache (size: {len(df)} rows)")
-            
-            # Apply date range filtering if needed
+
             if date_range is not None:
                 if isinstance(date_range, pd.DatetimeIndex):
                     filtered_df = df.loc[df.index.isin(date_range)]
-                    logging.debug(f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex")
+                    logging.debug(
+                        f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex"
+                    )
                     return filtered_df
                 else:
                     start_date, end_date = date_range
                     filtered_df = df.loc[start_date:end_date]
-                    logging.debug(f"Filtered {ticker} to {len(filtered_df)} rows using range")
+                    logging.debug(
+                        f"Filtered {ticker} to {len(filtered_df)} rows using range"
+                    )
                     return filtered_df
             return df
-        
+
         try:
-            # Load based on file format
             logging.debug(f"Loading {ticker} from {file_path}")
-            if file_format == 'parquet':
-                df = pd.read_parquet(file_path)
-            elif file_format in ['csv', 'csv.gz']:
-                if file_format == 'csv.gz':
-                    df = pd.read_csv(file_path, compression='gzip')
+            if file_format == "parquet":
+                if date_range is not None and not isinstance(
+                    date_range, pd.DatetimeIndex
+                ):
+                    df = pd.read_parquet(
+                        file_path,
+                        filters=[
+                            ("index", ">=", date_range[0]),
+                            ("index", "<=", date_range[1]),
+                        ],
+                    )
+                else:
+                    df = pd.read_parquet(file_path)
+
+            elif file_format == "h5":
+                key = (
+                    ticker
+                    if ticker in pd.read_hdf(file_path, mode="r").keys()
+                    else "data"
+                )
+                if date_range is not None and not isinstance(
+                    date_range, pd.DatetimeIndex
+                ):
+                    df = pd.read_hdf(
+                        file_path,
+                        key=key,
+                        where="index >= @date_range[0] and index <= @date_range[1]",
+                    )
+                else:
+                    df = pd.read_hdf(file_path, key=key)
+
+            elif file_format in ["csv", "csv.gz"]:
+                if file_format == "csv.gz":
+                    df = pd.read_csv(file_path, compression="gzip")
                 else:
                     df = pd.read_csv(file_path)
-                
-                # Ensure the DataFrame has a DatetimeIndex - use first column as date
                 first_col = df.columns[0]
                 df.set_index(first_col, inplace=True)
                 df.index = pd.to_datetime(df.index)
+
             else:
                 logging.warning(f"Unsupported file format: {file_format}")
                 return pd.DataFrame()
-            
-            # Ensure the index is a DatetimeIndex
+
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
-            
-            # Sort the index to ensure chronological order
+
             df = df.sort_index()
             if len(df) > 0:
-                logging.debug(f"Loaded {ticker}: {len(df)} rows, range: {df.index[0]} to {df.index[-1]}")
+                logging.debug(
+                    f"Loaded {ticker}: {len(df)} rows, range: {df.index[0]} to {df.index[-1]}"
+                )
             else:
                 logging.warning(f"Loaded empty DataFrame for {ticker}")
                 return df
-            
-            # Add to cache
-            self._file_cache[file_path] = {
-                'data': df,
-                'last_accessed': time.time()
-            }
-            
-            # Clean cache if needed
+
+            self._file_cache[file_path] = {"data": df, "last_accessed": time.time()}
             self._clear_cache_if_needed()
-            
-            # Apply date range filtering if needed
+
             if date_range is not None:
                 if isinstance(date_range, pd.DatetimeIndex):
                     filtered_df = df.loc[df.index.isin(date_range)]
-                    logging.debug(f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex")
+                    logging.debug(
+                        f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex"
+                    )
                     return filtered_df
                 else:
                     start_date, end_date = date_range
                     filtered_df = df.loc[start_date:end_date]
-                    logging.debug(f"Filtered {ticker} to {len(filtered_df)} rows using range")
+                    logging.debug(
+                        f"Filtered {ticker} to {len(filtered_df)} rows using range"
+                    )
                     return filtered_df
             return df
-            
+
         except Exception as e:
             logging.warning(f"Error loading data for {ticker}: {str(e)}")
             return pd.DataFrame()
@@ -692,10 +735,10 @@ class ParameterOptimizer:
     def split_consecutive(self, arr):
         """
         Split an array into consecutive chunks.
-        
+
         Args:
             arr: Array to split
-            
+
         Returns:
             list: List of consecutive chunks
         """
@@ -726,36 +769,49 @@ class ParameterOptimizer:
             self.collect_data_info(data_dir)
 
         # Find common date range across all tickers
-        min_dates = [info['start_date'] for info in self.data_info.values() 
-                    if info['start_date'] is not None]
-        max_dates = [info['end_date'] for info in self.data_info.values() 
-                    if info['end_date'] is not None]
-        
+        min_dates = [
+            info["start_date"]
+            for info in self.data_info.values()
+            if info["start_date"] is not None
+        ]
+        max_dates = [
+            info["end_date"]
+            for info in self.data_info.values()
+            if info["end_date"] is not None
+        ]
+
         if not min_dates or not max_dates:
             raise ValueError("No valid date ranges found in data info.")
-            
+
         global_start_date = min(min_dates)  # Earliest of all start dates
-        global_end_date = max(max_dates)    # Latest of all end dates
-        
-        logging.info(f"Using common date range: {global_start_date} to {global_end_date}")
-        
+        global_end_date = max(max_dates)  # Latest of all end dates
+
+        logging.info(
+            f"Using common date range: {global_start_date} to {global_end_date}"
+        )
+
         # Determine most common frequency
-        frequencies = [info['freq'] for info in self.data_info.values() if 'freq' in info]
+        frequencies = [
+            info["freq"] for info in self.data_info.values() if "freq" in info
+        ]
         if not frequencies:
-            common_freq = 'D'  # Default to daily if no frequencies found
+            common_freq = "D"  # Default to daily if no frequencies found
         else:
             from collections import Counter
+
             freq_counter = Counter(frequencies)
             common_freq = freq_counter.most_common(1)[0][0]
-        
+
         logging.info(f"Using common frequency: {common_freq}")
-        
+
         # Calculate a common date range length for all tickers using inferred frequency
-        common_date_range = pd.date_range(start=global_start_date, end=global_end_date, freq=common_freq)
+        common_date_range = pd.date_range(
+            start=global_start_date, end=global_end_date, freq=common_freq
+        )
         common_length = len(common_date_range)
-        
+
         logging.info(f"Common date range length: {common_length} time periods")
-        
+
         total_comb = math.comb(n_splits, n_test_splits)
         if n_test_splits == 0 or n_splits == 0:
             logging.info(
@@ -771,16 +827,16 @@ class ParameterOptimizer:
             logging.info(
                 f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
             )
-            
+
             # Generate CPCV indices once based on common length
             is_test, paths, path_folds = self.cpcv_generator(
                 common_length, n_splits, n_test_splits, verbose=False
             )
-            
+
             for ticker, info in self.data_info.items():
                 # Map the common indices to ticker-specific data
                 self.backtest_paths[ticker] = paths
-                
+
                 for combination_num in range(is_test.shape[1]):
                     if combination_num not in self.combcv_dict:
                         self.combcv_dict[combination_num] = {}
@@ -810,64 +866,140 @@ class ParameterOptimizer:
         ticker_count = len(self.current_group)
         mode = "training" if is_train else "testing"
         logging.info(f"Generating {mode} indices for {ticker_count} tickers")
-        
+
         total_indices = 0
         min_date = None
         max_date = None
-        
+
         for ticker, group_info in self.current_group.items():
             select_idx = group_info["train"]
             if group_info["test"] and not is_train:
                 select_idx = group_info["test"]
-                
+
             if not select_idx:
                 logging.debug(f"No {mode} indices for ticker {ticker}")
                 continue
-                
+
             for i, idx in enumerate(select_idx):
                 if i not in group_indices:
                     group_indices[i] = {}
-                
+
                 group_indices[i][ticker] = idx  # Store indices instead of DataFrames
-                
+
                 # Update statistics for logging
                 total_indices += len(idx)
-                
+
                 # Track date range if possible
                 if isinstance(idx, pd.DatetimeIndex) and len(idx) > 0:
                     curr_min = idx.min()
                     curr_max = idx.max()
-                    
+
                     if min_date is None or curr_min < min_date:
                         min_date = curr_min
-                    
+
                     if max_date is None or curr_max > max_date:
                         max_date = curr_max
-        
+
         # Log summary of generated indices
         group_count = len(group_indices)
-        avg_tickers_per_group = sum(len(indices) for indices in group_indices.values()) / max(1, group_count)
-        
+        avg_tickers_per_group = sum(
+            len(indices) for indices in group_indices.values()
+        ) / max(1, group_count)
+
         if min_date is not None and max_date is not None:
             date_range = f"{min_date} to {max_date}"
-            logging.info(f"Generated {group_count} {mode} groups with {total_indices} total indices, date range: {date_range}")
+            logging.info(
+                f"Generated {group_count} {mode} groups with {total_indices} total indices, date range: {date_range}"
+            )
         else:
-            logging.info(f"Generated {group_count} {mode} groups with {total_indices} total indices")
-            
+            logging.info(
+                f"Generated {group_count} {mode} groups with {total_indices} total indices"
+            )
+
         logging.info(f"Average tickers per group: {avg_tickers_per_group:.1f}")
-        
+
         for group_num, group_data in group_indices.items():
             ticker_count = len(group_data)
-            index_counts = {ticker: len(indices) for ticker, indices in group_data.items()}
+            index_counts = {
+                ticker: len(indices) for ticker, indices in group_data.items()
+            }
             avg_indices = sum(index_counts.values()) / max(1, ticker_count)
-            logging.debug(f"Group {group_num}: {ticker_count} tickers, avg {avg_indices:.1f} indices per ticker")
-            
+            logging.debug(
+                f"Group {group_num}: {ticker_count} tickers, avg {avg_indices:.1f} indices per ticker"
+            )
+
         return group_indices
+
+    def calculate_average_row_size(
+        self, data_dir: str, sample_ticker: str, sample_date_range: tuple
+    ) -> float:
+        """
+        Calculate the average memory size per row based on a sample ticker.
+
+        Args:
+            data_dir (str): Directory containing data files.
+            sample_ticker (str): Ticker to use for sampling.
+            sample_date_range (tuple): Date range for the sample (start, end).
+
+        Returns:
+            float: Average memory size per row in bytes.
+        """
+
+        df = self.load_ticker_data(
+            sample_ticker, date_range=sample_date_range, data_dir=data_dir
+        )
+        if df.empty:
+            logging.warning(f"Sample data for {sample_ticker} is empty.")
+            return 0
+
+        total_memory = df.memory_usage(deep=True).sum()
+        num_rows = len(df)
+        average_row_size = total_memory / num_rows if num_rows > 0 else 0
+        logging.debug(
+            f"Average row size for {sample_ticker}: {average_row_size:.2f} bytes"
+        )
+        return average_row_size
+
+    def estimate_memory_size(self, group_indices: dict, data_dir: str) -> float:
+        """
+        Estimate the memory size (in MB) required for a fold's training data.
+
+        Args:
+            group_indices (dict): Mapping of group numbers to ticker indices.
+            data_dir (str): Directory containing data files.
+
+        Returns:
+            float: Estimated memory size in MB.
+        """
+
+        if self.average_row_size_bytes is None:
+            sample_ticker = list(self.data_info.keys())[0]
+            sample_start = self.data_info[sample_ticker]["start_date"]
+            sample_end = sample_start + pd.Timedelta(days=10)
+            sample_date_range = (sample_start, sample_end)
+            self.average_row_size_bytes = self.calculate_average_row_size(
+                data_dir, sample_ticker, sample_date_range
+            )
+
+        total_rows = 0
+        for group_num, ticker_indices in group_indices.items():
+            for ticker, indices in ticker_indices.items():
+                if isinstance(indices, list):
+                    total_rows += sum(len(chunk) for chunk in indices)
+                else:
+                    total_rows += len(indices)
+
+        # Estimate memory with a 20% buffer
+        total_memory_bytes = total_rows * self.average_row_size_bytes * 1.2
+        estimated_memory_mb = total_memory_bytes / (1024 * 1024)  # Convert to MB
+        logging.debug(f"Estimated {total_rows} rows, {estimated_memory_mb:.2f} MB")
+        return estimated_memory_mb
 
     def optimize(
         self,
         data_dir: str,
         params: dict,
+        optimizer_params: dict,
         n_runs: int,
         best_trials_pct: float,
         n_splits: int = None,
@@ -876,10 +1008,11 @@ class ParameterOptimizer:
     ):
         """
         Optimize parameters using combinatorial cross-validation.
-        
+
         Args:
             data_dir (str): Directory containing data files
             params (dict): Initial parameters for the optimization.
+            optimizer_params (dict): Internal parameters for optimization.
             n_runs (int): Number of optimization runs.
             best_trials_pct (float): Percentage of best trials to consider.
             n_splits (int): Number of total splits for CPCV. Required.
@@ -888,81 +1021,154 @@ class ParameterOptimizer:
         """
         # Start timing for overall process
         optimization_start_time = time.time()
-        
+
         # Log optimization parameters
         param_keys_to_optimize = [k for k, v in params.items() if isinstance(v, list)]
-        logging.info(f"Starting optimization with {n_runs} trials per fold and {len(param_keys_to_optimize)} parameters to optimize")
+        logging.info(
+            f"Starting optimization with {n_runs} trials per fold and {len(param_keys_to_optimize)} parameters to optimize"
+        )
         if param_keys_to_optimize:
             logging.info(f"Parameters to optimize: {param_keys_to_optimize}")
-        
+
         # Initialize result tracking
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
+        max_memory_mb = optimizer_params.get("max_memory_mb", 1000000)
 
         # Collect data info instead of loading all data
         if not self.data_info:
             data_info_start = time.time()
             self.collect_data_info(data_dir)
             data_info_duration = time.time() - data_info_start
-            logging.info(f"Collected info for {len(self.data_info)} tickers in {data_info_duration:.2f}s")
-        
+            logging.info(
+                f"Collected info for {len(self.data_info)} tickers in {data_info_duration:.2f}s"
+            )
+
         # If train_test_date is provided, limit max date in data_info
         if train_test_date is not None:
             train_test_datetime = pd.Timestamp(train_test_date)
             logging.info(f"Limiting data to before {train_test_date}")
-            
+
             # Update data_info to limit end_date to train_test_date
             for ticker in self.data_info:
-                if self.data_info[ticker]['end_date'] > train_test_datetime:
-                    self.data_info[ticker]['end_date'] = train_test_datetime
-        
+                if self.data_info[ticker]["end_date"] > train_test_datetime:
+                    self.data_info[ticker]["end_date"] = train_test_datetime
+
         # Store data directory path for subsequent operations
         self.params_dict["data_path"] = data_dir
-        
+
         # Check if n_splits and n_test_splits are provided
         if n_splits is None or n_test_splits is None:
             raise ValueError("n_splits and n_test_splits must be provided")
-        
+
         # Create combinatorial splits based on data info
         splits_start = time.time()
-        self.create_date_combcv_dict(data_dir, n_splits=n_splits, n_test_splits=n_test_splits)
+        self.create_date_combcv_dict(
+            data_dir, n_splits=n_splits, n_test_splits=n_test_splits
+        )
         splits_duration = time.time() - splits_start
-        logging.info(f"Created {len(self.combcv_dict)} combinatorial splits in {splits_duration:.2f}s")
-        
+        logging.info(
+            f"Created {len(self.combcv_dict)} combinatorial splits in {splits_duration:.2f}s"
+        )
+
         # Process each combinatorial split
         total_folds = len(self.combcv_dict)
         for fold_idx, (fold_num, date_ranges) in enumerate(self.combcv_dict.items()):
             fold_start_time = time.time()
             logging.info(f"Starting fold {fold_num} ({fold_idx+1}/{total_folds})")
-            
+
             # Set current group for this fold
             self.current_group = date_ranges
-            
+
             # Generate indices before optimization
             group_indices = self.generate_group_indices(is_train=True)
-            
+
+            estimated_memory = self.estimate_memory_size(group_indices, data_dir)
+            logging.info(
+                f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} MB"
+            )
+
+            if estimated_memory <= max_memory_mb:
+                logging.info(f"Preloading data for fold {fold_num}")
+
+                ticker_index_pairs = {}
+                for group_num, ticker_indices in group_indices.items():
+                    for ticker, indices in ticker_indices.items():
+                        ticker_index_pairs[ticker] = indices
+
+                n_workers = min(self.n_jobs, len(ticker_index_pairs), 32)
+
+                if n_workers <= 1:
+                    train_data = {}
+                    for ticker, indices in tqdm(
+                        ticker_index_pairs.items(), desc="Loading ticker data"
+                    ):
+                        df = self.load_ticker_data(
+                            ticker, date_range=indices, data_dir=data_dir
+                        )
+                        if df is not None and not df.empty:
+                            train_data[ticker] = df
+                else:
+                    logging.info(
+                        f"Loading {len(ticker_index_pairs)} tickers using {n_workers} parallel workers"
+                    )
+
+                    from multiprocessing import Pool
+
+                    def _load_single_ticker(args):
+                        ticker, indices, data_dir = args
+                        df = self.load_ticker_data(
+                            ticker, date_range=indices, data_dir=data_dir
+                        )
+                        return ticker, df
+
+                    load_args = [
+                        (ticker, indices, data_dir)
+                        for ticker, indices in ticker_index_pairs.items()
+                    ]
+                    with Pool(processes=n_workers) as pool:
+                        results = list(
+                            tqdm(
+                                pool.imap(_load_single_ticker, load_args),
+                                total=len(load_args),
+                                desc="Loading ticker data",
+                            )
+                        )
+
+                    train_data = {}
+                    for ticker, df in results:
+                        if df is not None and not df.empty:
+                            train_data[ticker] = df
+
+                data_source = train_data
+            else:
+                logging.info(
+                    f"Memory limit ({max_memory_mb} MB) exceeded, loading per trial"
+                )
+                data_source = data_dir
+
             # Define the objective function using combcv_pl
             objective_func = self.create_objective(
                 group_indices,
                 self.params_dict,
                 self.calc_pl,
-                data_dir  # Pass data directory path
+                data_source,  # data type depends on memory usage
             )
-            
+
             # Create and configure the Optuna study
             pruner = RepeatPruner()
             study = optuna.create_study(
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(multivariate=True),
-                pruner=pruner
+                pruner=pruner,
             )
-            
+
             # Run the optimization
             logging.info(f"Running {n_runs} trials for fold {fold_num}")
             study.optimize(objective_func, n_trials=n_runs, n_jobs=self.n_jobs)
             optimization_duration = time.time() - fold_start_time
-            
+
             # Process and sort trials
             all_trials = sorted(
                 [
@@ -974,111 +1180,118 @@ class ParameterOptimizer:
                 key=lambda trial: trial.value,
                 reverse=True,
             )
-            
+
             completed_trials = len(all_trials)
-            logging.info(f"Fold {fold_num}: {completed_trials}/{n_runs} trials completed in {optimization_duration:.2f}s")
-            
+            logging.info(
+                f"Fold {fold_num}: {completed_trials}/{n_runs} trials completed in {optimization_duration:.2f}s"
+            )
+
             if completed_trials == 0:
                 logging.warning(f"Fold {fold_num}: No successfully completed trials")
                 continue
-            
+
             # Extract parameters from trials
             all_trials = [trial.params for trial in all_trials]
-            
+
             # Fill in default parameters
             for trial_params in all_trials:
                 for key, value in self.params_dict.items():
                     if key not in trial_params:
                         trial_params[key] = value
-            
+
             # Add to the list of all tested parameters
             all_tested_params.extend(all_trials)
-            
+
             # Select top parameters based on percentage
             top_count = max(1, int(len(all_trials) * best_trials_pct))
             top_params = all_trials[:top_count]
-            logging.info(f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})")
-            
+            logging.info(
+                f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})"
+            )
+
             # Generate test indices
             test_indices = self.generate_group_indices(is_train=False)
-            
+
             # Evaluate top parameters on validation data
             evaluation_start = time.time()
             for i, trial_params in enumerate(top_params):
                 sharpe, _ = self.combcv_pl(
-                    trial_params,
-                    test_indices,
-                    self.calc_pl,
-                    data_dir
+                    trial_params, test_indices, self.calc_pl, data_dir
                 )
-                
+
                 # Record results
                 if i == 0:
                     trial_params["fold_num"] = fold_num
                 else:
                     trial_params["fold_num"] = np.nan
-                    
+
                 trial_params["sharpe"] = sharpe
                 result.append(trial_params)
-                logging.info(f"Fold {fold_num}: Parameter set {i+1}/{len(top_params)} - Test Sharpe: {sharpe:.4f}")
-            
+                logging.info(
+                    f"Fold {fold_num}: Parameter set {i+1}/{len(top_params)} - Test Sharpe: {sharpe:.4f}"
+                )
+
             evaluation_duration = time.time() - evaluation_start
-            logging.info(f"Fold {fold_num}: Validation completed in {evaluation_duration:.2f}s")
-            
+            logging.info(
+                f"Fold {fold_num}: Validation completed in {evaluation_duration:.2f}s"
+            )
+
             # Save the best parameters for this fold
             self.best_params_by_fold[fold_num] = top_params[0]
-            
+
             # Save interim results
             if self.save_path is not None:
-                interim_df = pd.DataFrame(result).sort_values(
-                    "sharpe", ascending=False
-                )
+                interim_df = pd.DataFrame(result).sort_values("sharpe", ascending=False)
                 if "data_path" in interim_df.columns:
                     del interim_df["data_path"]
-                    
-                interim_file = self.save_path + self.file_prefix + f"interim_fold_{fold_num}.csv"
+
+                interim_file = (
+                    self.save_path + self.file_prefix + f"interim_fold_{fold_num}.csv"
+                )
                 interim_df.to_csv(interim_file, index=False)
                 logging.info(f"Interim results saved to {interim_file}")
-            
+
             fold_duration = time.time() - fold_start_time
             logging.info(f"Completed fold {fold_num} in {fold_duration:.2f}s")
-        
+
         # Save final results
         self.top_params_list = result
         self.all_tested_params = list(
             {frozenset(d.items()): d for d in all_tested_params}.values()
         )
-        
+
         if self.save_path is not None:
             param_df = pd.DataFrame(self.top_params_list).sort_values(
                 "sharpe", ascending=False
             )
-            
+
             if "data_path" in param_df.columns:
                 del param_df["data_path"]
-            
+
             top_file = self.save_path + self.file_prefix + "top_params.csv"
             param_df.to_csv(top_file, index=False)
-            
-            all_params_file = self.save_path + self.file_prefix + "all_tested_params.csv"
+
+            all_params_file = (
+                self.save_path + self.file_prefix + "all_tested_params.csv"
+            )
             all_tested_params_df = pd.DataFrame(self.all_tested_params)
             all_tested_params_df.to_csv(all_params_file, index=False)
-            
+
             logging.info(f"Final results saved to {self.save_path}")
-        
+
         # Log summary statistics
         total_duration = time.time() - optimization_start_time
         hrs, rem = divmod(total_duration, 3600)
         mins, secs = divmod(rem, 60)
         logging.info(f"Total optimization time: {int(hrs)}h {int(mins)}m {secs:.2f}s")
-        
+
         # Print best parameters
         if result:
             best_params = param_df.iloc[0].to_dict()
-            best_sharpe = best_params.get('sharpe', np.nan)
+            best_sharpe = best_params.get("sharpe", np.nan)
             logging.info(f"Best parameters found: Sharpe={best_sharpe:.4f}")
             for k, v in best_params.items():
-                if k != 'sharpe' and k != 'fold_num':
+                if k != "sharpe" and k != "fold_num":
                     logging.info(f"  {k}: {v}")
         else:
             logging.warning("No valid parameter sets found")
@@ -1091,6 +1304,7 @@ class ParameterOptimizer:
             data_dir (str): Directory containing data files
             params (dict): Parameters for the performance calculation.
         """
+
         def plot_results(returns, save_file_name):
             metrics = calculate_metrics(returns)
             text = ""
@@ -1117,20 +1331,20 @@ class ParameterOptimizer:
             plt.show()
 
         logging.info("Plotting returns")
-        
+
         # Clear any existing cache
         self._file_cache = {}
-        
+
         # For plotting, we need to load all data
         if not self.data_info:
             self.collect_data_info(data_dir)
-            
+
         # Get list of tickers to load
         tickers = list(self.data_info.keys())
-        
+
         # Use parallel loading for better performance
         all_data = self.load_multiple_tickers(tickers, data_dir)
-        
+
         logging.info(f"Calculating returns for {len(all_data)} tickers")
         returns = self.calc_pl(all_data, params)
 
@@ -1247,7 +1461,7 @@ class ParameterOptimizer:
     def run_stress_tests(self, data_dir, num_workers=5):
         """
         Run stress tests on the best parameter sets using the combcv_pl function.
-        
+
         Args:
             data_dir (str): Directory containing data files
             num_workers (int): Number of workers for parallel processing
@@ -1257,35 +1471,37 @@ class ParameterOptimizer:
         # Collect data info if not already done
         if not self.data_info:
             self.collect_data_info(data_dir)
-            
+
         # Clear any existing cache
         self._file_cache = {}
-        
+
         if not self.all_tested_params:
             logging.warning("No tested parameters available for stress tests.")
             return
-            
+
         # Create a single set of indices covering the entire dataset
         all_indices = {}
         all_tickers = list(self.data_info.keys())
-        
+
         # Load all ticker data in parallel for better performance
         logging.info(f"Loading data for {len(all_tickers)} tickers")
         all_data = self.load_multiple_tickers(all_tickers, data_dir)
-        
+
         if not all_data:
             logging.error("Failed to load any valid data. Cannot run stress tests.")
             return
-            
+
         logging.info(f"Successfully loaded data for {len(all_data)} tickers")
-        
+
         # Function to process a single parameter set
         def process_param_set(params):
             try:
                 # Use calc_pl directly on the loaded data
                 returns = self.calc_pl(all_data, params)
-                
-                if returns is not None and not (isinstance(returns, pd.Series) and returns.empty):
+
+                if returns is not None and not (
+                    isinstance(returns, pd.Series) and returns.empty
+                ):
                     if isinstance(returns, dict):
                         # If returns is a dictionary, use the "Total" key or first key available
                         if "Total" in returns:
@@ -1298,11 +1514,13 @@ class ParameterOptimizer:
             except Exception as e:
                 logging.warning(f"Error processing parameters {params}: {str(e)}")
                 return pd.Series()
-        
+
         # Process all parameter sets
         stress_test_workers = min(num_workers, len(self.all_tested_params), self.n_jobs)
-        logging.info(f"Processing {len(self.all_tested_params)} parameter sets with {stress_test_workers} workers")
-        
+        logging.info(
+            f"Processing {len(self.all_tested_params)} parameter sets with {stress_test_workers} workers"
+        )
+
         if stress_test_workers > 1:
             # Use multiprocessing for parallel execution
             with multiprocessing.Pool(processes=stress_test_workers) as pool:
@@ -1310,13 +1528,15 @@ class ParameterOptimizer:
                     tqdm(
                         pool.map(process_param_set, self.all_tested_params),
                         total=len(self.all_tested_params),
-                        desc="Processing parameter sets"
+                        desc="Processing parameter sets",
                     )
                 )
         else:
             # Single-process execution
             results = []
-            for params in tqdm(self.all_tested_params, desc="Processing parameter sets"):
+            for params in tqdm(
+                self.all_tested_params, desc="Processing parameter sets"
+            ):
                 results.append(process_param_set(params))
 
         # Filter out empty DataFrames and run stress tests
@@ -1326,28 +1546,30 @@ class ParameterOptimizer:
             run_stress_tests(result_df)
         else:
             logging.warning("No valid results for stress tests")
-    
+
     def reconstruct_equity_curves(self, data_dir):
         """
         Reconstruct equity curves based on the best parameters using combcv_pl for consistency.
-        
+
         Args:
             data_dir (str): Directory containing data files
         """
         logging.info("Reconstructing validation equity curves")
-        
+
         # Collect data info if not already done
         if not self.data_info:
             self.collect_data_info(data_dir)
-            
+
         # Clear any existing cache
         self._file_cache = {}
 
         arrays = list(self.backtest_paths.values())
         if not arrays:
-            logging.error("No backtest paths available. Cannot reconstruct equity curves.")
+            logging.error(
+                "No backtest paths available. Cannot reconstruct equity curves."
+            )
             return
-            
+
         num_columns = arrays[0].shape[1]
         if not all(arr.shape[1] == num_columns for arr in arrays):
             raise Exception("Tickers have different number of backtest paths")
@@ -1368,12 +1590,12 @@ class ParameterOptimizer:
             logging.info(f"Starting for path {path_num}")
             path_returns = []
             unique_folds = np.unique(arrays[0][:, path_num])
-            
+
             for fold in unique_folds:
                 logging.info(f"Starting for fold {fold}")
                 fold = int(fold)
                 params = self.best_params_by_fold[fold]
-                
+
                 # Create indices for this fold and path
                 test_group = {}
                 for ticker, path_array in self.backtest_paths.items():
@@ -1383,20 +1605,20 @@ class ParameterOptimizer:
                         if 0 not in test_group:
                             test_group[0] = {}
                         # If we have date mapping, use it, otherwise use integer indices
-                        if hasattr(self, 'date_mapping') and path_num in self.date_mapping:
+                        if (
+                            hasattr(self, "date_mapping")
+                            and path_num in self.date_mapping
+                        ):
                             test_group[0][ticker] = self.date_mapping[path_num][fold]
                         else:
                             test_group[0][ticker] = indices
-                
+
                 # Use combcv_pl to get returns
                 if test_group:
                     _, returns_list = self.combcv_pl(
-                        params,
-                        test_group,
-                        self.calc_pl,
-                        data_dir
+                        params, test_group, self.calc_pl, data_dir
                     )
-                    
+
                     if returns_list:
                         # Combine returns from all groups (usually just one for test data)
                         fold_returns = pd.concat(returns_list)
@@ -1407,7 +1629,7 @@ class ParameterOptimizer:
                 path_returns = pd.concat(path_returns)
                 path_returns = path_returns.sort_index()
                 final_returns.append(path_returns)
-                
+
                 # Calculate metrics for this path
                 metrics = calculate_metrics(path_returns)
                 final_metrics.append(metrics)
@@ -1473,9 +1695,12 @@ class ParameterOptimizer:
 
         # For simplicity, we'll just return the best parameters without clustering
         if not param_df.empty:
-            best_param_set = pd.DataFrame(self.top_params_list).sort_values(
-                by="sharpe", ascending=False
-            ).iloc[0].to_dict()
+            best_param_set = (
+                pd.DataFrame(self.top_params_list)
+                .sort_values(by="sharpe", ascending=False)
+                .iloc[0]
+                .to_dict()
+            )
             logging.info(f"Best params: {best_param_set}")
             return best_param_set
         else:
@@ -1521,7 +1746,7 @@ class ParameterOptimizer:
             param_names=param_names,
             calc_pl=self.calc_pl,
             calculate_metrics=calculate_metrics,
-            n_jobs=self.n_jobs  # Pass n_jobs from the class
+            n_jobs=self.n_jobs,  # Pass n_jobs from the class
         )
 
         # Choose between multiprocessing and single-process execution
@@ -1529,8 +1754,10 @@ class ParameterOptimizer:
             # Determine how many jobs to allocate to data loading vs parameter combinations
             # If we have many cores, allocate some for data loading and some for param combinations
             n_param_jobs = max(1, min(self.n_jobs // 2, total_combinations))
-            n_data_jobs = max(1, min(self.n_jobs // 2, 8))  # Limit data loading parallelism
-            
+            n_data_jobs = max(
+                1, min(self.n_jobs // 2, 8)
+            )  # Limit data loading parallelism
+
             # Update the partial function to use the adjusted number of data loading workers
             partial_process = partial(
                 process_combination,
@@ -1538,16 +1765,16 @@ class ParameterOptimizer:
                 param_names=param_names,
                 calc_pl=self.calc_pl,
                 calculate_metrics=calculate_metrics,
-                n_jobs=n_data_jobs  # Use a portion of available cores for data loading
+                n_jobs=n_data_jobs,  # Use a portion of available cores for data loading
             )
-            
+
             # Use multiprocessing for parallel execution of parameter combinations
             with multiprocessing.Pool(n_param_jobs) as pool:
                 results = list(
                     tqdm(
                         pool.imap_unordered(partial_process, param_combinations),
                         total=total_combinations,
-                        desc="Processing parameter combinations"
+                        desc="Processing parameter combinations",
                     )
                 )
         else:
@@ -1556,7 +1783,7 @@ class ParameterOptimizer:
                 tqdm(
                     (partial_process(combo) for combo in param_combinations),
                     total=total_combinations,
-                    desc="Processing parameter combinations"
+                    desc="Processing parameter combinations",
                 )
             )
 
@@ -1625,157 +1852,189 @@ class ParameterOptimizer:
     def split_data(self, data_dir: str, train_end_date: str):
         """
         Split data into training and validation sets based on a date.
-        
+
         Args:
             data_dir (str): Directory containing data files
             train_end_date (str): End date for training data in format YYYY-MM-DD
-            
+
         Returns:
             dict: Dictionary with training and validation date ranges
         """
         logging.info(f"Splitting data with train end date: {train_end_date}")
-        
+
         # Collect data info if not already done
         if not self.data_info:
             self.collect_data_info(data_dir)
-        
+
         # Convert train_end_date to datetime
         train_end = pd.Timestamp(train_end_date)
-        
+
         # Find the earliest and latest dates in the data
-        min_dates = [info['start_date'] for info in self.data_info.values() if info['start_date'] is not None]
-        max_dates = [info['end_date'] for info in self.data_info.values() if info['end_date'] is not None]
-        
+        min_dates = [
+            info["start_date"]
+            for info in self.data_info.values()
+            if info["start_date"] is not None
+        ]
+        max_dates = [
+            info["end_date"]
+            for info in self.data_info.values()
+            if info["end_date"] is not None
+        ]
+
         if not min_dates or not max_dates:
             raise ValueError("No valid date ranges found in data info.")
-        
+
         data_start = min(min_dates)
         data_end = max(max_dates)
-        
+
         # Ensure train_end is within the data range
         if train_end < data_start or train_end > data_end:
-            logging.warning(f"Train end date {train_end} is outside data range ({data_start} to {data_end}). Adjusting.")
+            logging.warning(
+                f"Train end date {train_end} is outside data range ({data_start} to {data_end}). Adjusting."
+            )
             train_end = min(max(train_end, data_start), data_end)
-        
+
         # Create date ranges for training and validation
         train_range = (data_start, train_end)
         val_range = (train_end, data_end)
-        
-        logging.info(f"Data split: Training from {train_range[0]} to {train_range[1]}, Validation from {val_range[0]} to {val_range[1]}")
-        
-        return {
-            'train': train_range,
-            'val': val_range
-        }
+
+        logging.info(
+            f"Data split: Training from {train_range[0]} to {train_range[1]}, Validation from {val_range[0]} to {val_range[1]}"
+        )
+
+        return {"train": train_range, "val": val_range}
 
     def create_date_combcv_dict(self, data_dir: str, n_splits: int, n_test_splits: int):
         """
         Create a dictionary for combinatorial cross-validation using date ranges.
         Based on the same algorithm as create_combcv_dict but storing datetime indices.
-        
+
         Args:
             data_dir (str): Directory containing data files
             n_splits (int): Number of total splits.
             n_test_splits (int): Number of test splits.
-            
+
         Returns:
             dict: Dictionary mapping combination numbers to date ranges
         """
-        logging.info(f"Creating date-based combinatorial splits: {n_splits} total, {n_test_splits} test")
-        
+        logging.info(
+            f"Creating date-based combinatorial splits: {n_splits} total, {n_test_splits} test"
+        )
+
         # Collect data info if not already done
         if not self.data_info:
             self.collect_data_info(data_dir)
-            
+
         # Find the common date range across all tickers
-        min_dates = [info['start_date'] for info in self.data_info.values() if info['start_date'] is not None]
-        max_dates = [info['end_date'] for info in self.data_info.values() if info['end_date'] is not None]
-        
+        min_dates = [
+            info["start_date"]
+            for info in self.data_info.values()
+            if info["start_date"] is not None
+        ]
+        max_dates = [
+            info["end_date"]
+            for info in self.data_info.values()
+            if info["end_date"] is not None
+        ]
+
         if not min_dates or not max_dates:
             raise ValueError("No valid date ranges found in data info.")
-            
+
         # Use the earliest start date and latest end date to ensure all tickers have the same date range
         global_start_date = min(min_dates)
         global_end_date = max(max_dates)
-        
-        logging.info(f"Using common date range for all tickers: {global_start_date} to {global_end_date}")
-        
+
+        logging.info(
+            f"Using common date range for all tickers: {global_start_date} to {global_end_date}"
+        )
+
         # Determine most common frequency
-        frequencies = [info['freq'] for info in self.data_info.values() if 'freq' in info]
+        frequencies = [
+            info["freq"] for info in self.data_info.values() if "freq" in info
+        ]
         if not frequencies:
-            common_freq = 'D'  # Default to daily if no frequencies found
+            common_freq = "D"  # Default to daily if no frequencies found
         else:
             from collections import Counter
+
             freq_counter = Counter(frequencies)
             common_freq = freq_counter.most_common(1)[0][0]
-        
+
         logging.info(f"Using common frequency: {common_freq}")
-        
+
         # Create a common date range for all tickers
-        common_date_range = pd.date_range(start=global_start_date, end=global_end_date, freq=common_freq)
+        common_date_range = pd.date_range(
+            start=global_start_date, end=global_end_date, freq=common_freq
+        )
         total_periods = len(common_date_range)
-        
+
         # Clear existing data
         self.combcv_dict = {}
         self.backtest_paths = {}
-        
+
         total_comb = math.comb(n_splits, n_test_splits)
-        
+
         if n_test_splits == 0 or n_splits == 0:
-            logging.info("Using the entire dataset as the training set with no validation groups.")
+            logging.info(
+                "Using the entire dataset as the training set with no validation groups."
+            )
             self.combcv_dict[0] = {}
             for ticker in self.data_info.keys():
                 self.combcv_dict[0][ticker] = {
-                    "train": [common_date_range],  # Store datetime index instead of array indices
+                    "train": [
+                        common_date_range
+                    ],  # Store datetime index instead of array indices
                     "test": None,
                 }
             return self.combcv_dict
-        
-        logging.info(f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}")
-        
+
+        logging.info(
+            f"Creating combinatorial train-val split, total_split: {n_splits}, out of which val groups: {n_test_splits}"
+        )
+
         # Generate CPCV indices once based on common length
         is_test, paths, path_folds = self.cpcv_generator(
             total_periods, n_splits, n_test_splits, verbose=False
         )
-        
+
         # Use the same cpcv_generator output for all tickers
         for ticker in self.data_info.keys():
             # Store the paths for later reconstruction
             self.backtest_paths[ticker] = paths
-            
+
             for combination_num in range(is_test.shape[1]):
                 if combination_num not in self.combcv_dict:
                     self.combcv_dict[combination_num] = {}
-                
+
                 # Get boolean arrays for train and test
                 train_mask = ~is_test[:, combination_num]
                 test_mask = is_test[:, combination_num]
-                
+
                 # Convert to indices
                 train_indices = np.where(train_mask)[0]
                 test_indices = np.where(test_mask)[0]
-                
+
                 # Split into consecutive chunks
                 train_indices = self.split_consecutive(train_indices)
                 test_indices = self.split_consecutive(test_indices)
-                
+
                 # Convert array indices to datetime indices
                 train_datetimes = []
                 for indices in train_indices:
                     if len(indices) > 0:
                         train_datetimes.append(common_date_range[indices])
-                
+
                 test_datetimes = []
                 for indices in test_indices:
                     if len(indices) > 0:
                         test_datetimes.append(common_date_range[indices])
-                
+
                 # Store datetime indices instead of array indices
                 self.combcv_dict[combination_num][ticker] = {
                     "train": train_datetimes,
                     "test": test_datetimes,
                 }
-        
+
         # Store the mapping between indices and dates for equity curve reconstruction
         self.date_mapping = {}
         for p in range(paths.shape[1]):
@@ -1783,70 +2042,78 @@ class ParameterOptimizer:
             for fold in np.unique(paths[:, p]):
                 indices = np.where(paths[:, p] == fold)[0]
                 self.date_mapping[p][fold] = common_date_range[indices]
-        
+
         logging.info(f"Created {len(self.combcv_dict)} combinatorial splits")
         return self.combcv_dict
 
     def load_multiple_tickers(self, tickers, data_dir=None, date_range=None):
         """
         Load data for multiple tickers in parallel using multiprocessing.
-        
+
         Args:
             tickers (list): List of ticker symbols to load
             data_dir (str, optional): Directory to load data from
             date_range (tuple or DatetimeIndex, optional): Date range to filter data
-            
+
         Returns:
             dict: Dictionary mapping tickers to DataFrames
         """
         if not tickers:
             return {}
-            
+
         # Determine number of worker processes to use
         n_workers = min(self.n_jobs, len(tickers), 32)  # Cap at 32 workers max
-        
+
         if n_workers <= 1:
             # Single process loading
             result = {}
             for ticker in tqdm(tickers, desc="Loading ticker data"):
-                df = self.load_ticker_data(ticker, date_range=date_range, data_dir=data_dir)
+                df = self.load_ticker_data(
+                    ticker, date_range=date_range, data_dir=data_dir
+                )
                 if df is not None and not df.empty:
                     result[ticker] = df
             return result
-            
+
         # Prepare arguments for parallel processing
         load_args = [(ticker, data_dir or "", date_range) for ticker in tickers]
-        
+
         # Use process pool for parallel loading
-        logging.info(f"Loading {len(tickers)} tickers using {n_workers} parallel workers")
+        logging.info(
+            f"Loading {len(tickers)} tickers using {n_workers} parallel workers"
+        )
         with Pool(processes=n_workers) as pool:
             results = list(
                 tqdm(
                     pool.imap(load_single_ticker, load_args),
                     total=len(load_args),
-                    desc="Loading ticker data"
+                    desc="Loading ticker data",
                 )
             )
-        
+
         # Process results into a dictionary
         data_dict = {}
         loaded_count = 0
         total_rows = 0
-        
+
         for ticker, df in results:
             if df is not None and not df.empty:
                 data_dict[ticker] = df
                 loaded_count += 1
                 total_rows += len(df)
-                
-        logging.info(f"Successfully loaded {loaded_count}/{len(tickers)} tickers with {total_rows} total rows")
+
+        logging.info(
+            f"Successfully loaded {loaded_count}/{len(tickers)} tickers with {total_rows} total rows"
+        )
         return data_dict
 
 
-def process_combination(combination, data_dir, param_names, calc_pl=None, calculate_metrics=None, n_jobs=1):
+def process_combination(
+    combination, data_dir, param_names, calc_pl=None, calculate_metrics=None, n_jobs=1
+):
     """
     Process a parameter combination for the backtest.
-    
+
     Args:
         combination (tuple): Parameter combination to test.
         data_dir (str): Directory with data files.
@@ -1854,14 +2121,14 @@ def process_combination(combination, data_dir, param_names, calc_pl=None, calcul
         calc_pl (callable, optional): Function to calculate returns.
         calculate_metrics (callable, optional): Function to calculate additional metrics.
         n_jobs (int): Number of parallel workers for data loading.
-        
+
     Returns:
         dict: Dictionary with parameters, returns and metrics if successful, None otherwise.
     """
     start_time = time.time()
     params = dict(zip(param_names, combination))
     logging.info(f"Processing parameter combination: {params}")
-    
+
     try:
         # Create temporary ParameterOptimizer for this combination
         optimizer = ParameterOptimizer(
@@ -1869,39 +2136,41 @@ def process_combination(combination, data_dir, param_names, calc_pl=None, calcul
             calculate_metrics=calculate_metrics,
             save_path="",  # Temporary instance doesn't need paths
             save_file_prefix="",
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
         )
-        
+
         # Get ticker files
         ticker_files = get_ticker_filenames(data_dir)
         if not ticker_files:
             logging.warning(f"No ticker files found in {data_dir}")
             return None
-            
-        logging.info(f"Found {len(ticker_files)} ticker files, loading with {n_jobs} workers")
-        
+
+        logging.info(
+            f"Found {len(ticker_files)} ticker files, loading with {n_jobs} workers"
+        )
+
         # Prepare data structure
         all_data = {}
-        
+
         # Use multiprocessing for data loading if n_jobs > 1
         if n_jobs > 1:
             # Prepare arguments for parallel processing
             load_args = [(ticker, data_dir, None) for ticker in ticker_files]
-            
+
             # Use process pool for parallel loading
             with Pool(processes=n_jobs) as pool:
                 results = list(
                     tqdm(
                         pool.imap(load_single_ticker, load_args),
                         total=len(load_args),
-                        desc="Loading ticker data"
+                        desc="Loading ticker data",
                     )
                 )
-                
+
             # Process results
             loaded_data_count = 0
             total_rows = 0
-            
+
             for ticker, df in results:
                 if df is not None and not df.empty:
                     all_data[ticker] = df
@@ -1911,50 +2180,52 @@ def process_combination(combination, data_dir, param_names, calc_pl=None, calcul
             # Single-process loading for n_jobs = 1
             loaded_data_count = 0
             total_rows = 0
-            
+
             for ticker in tqdm(ticker_files, desc="Loading ticker data"):
                 df = optimizer.load_ticker_data(ticker, data_dir=data_dir)
                 if df is not None and not df.empty:
                     all_data[ticker] = df
                     loaded_data_count += 1
                     total_rows += len(df)
-                
+
         if loaded_data_count == 0:
             logging.error("Failed to load any valid data")
             return None
-            
-        logging.info(f"Loaded {loaded_data_count} ticker datasets with {total_rows} total rows")
-        
+
+        logging.info(
+            f"Loaded {loaded_data_count} ticker datasets with {total_rows} total rows"
+        )
+
         # Calculate returns for the combination
         try:
             returns = optimizer.calc_pl(all_data, params)
-            
+
             # If returned None or NaN, this combination isn't viable
             if returns is None or (isinstance(returns, float) and math.isnan(returns)):
                 logging.warning(f"Invalid returns for combination {params}: {returns}")
                 return None
-                
+
             # Calculate additional metrics if needed
             metrics = {}
             if calculate_metrics:
                 metrics = calculate_metrics(returns)
-                
+
             duration = time.time() - start_time
-            logging.info(f"Finished processing combination in {duration:.2f}s with valid returns")
-            
+            logging.info(
+                f"Finished processing combination in {duration:.2f}s with valid returns"
+            )
+
             # Return the results
-            result = {
-                "parameters": params,
-                "returns": returns,
-                "metrics": metrics
-            }
+            result = {"parameters": params, "returns": returns, "metrics": metrics}
             return result
-            
+
         except Exception as e:
-            logging.error(f"Error calculating returns for combination {params}: {str(e)}")
+            logging.error(
+                f"Error calculating returns for combination {params}: {str(e)}"
+            )
             logging.debug(f"Exception details: {traceback.format_exc()}")
             return None
-            
+
     except Exception as e:
         logging.error(f"Error processing combination {params}: {str(e)}")
         logging.debug(f"Exception details: {traceback.format_exc()}")
@@ -2060,73 +2331,73 @@ class ImmutableDataFrame:
 def get_ticker_filenames(data_dir):
     """
     Get a list of ticker filenames from a directory.
-    
+
     Args:
         data_dir (str): Directory containing data files
-        
+
     Returns:
         list: List of ticker names (without file extensions)
     """
     import glob
     import os
-    
+
     # Supported file types
-    extensions = ['*.parquet', '*.csv', '*.csv.gz']
+    extensions = ["*.parquet", "*.csv", "*.csv.gz"]
     ticker_files = []
-    
+
     for ext in extensions:
         pattern = os.path.join(data_dir, ext)
         files = glob.glob(pattern)
         for file_path in files:
             # Extract ticker name from filename (without extension)
             filename = os.path.basename(file_path)
-            ticker = filename.split('.')[0]
+            ticker = filename.split(".")[0]
             ticker_files.append(ticker)
-            
+
     return list(set(ticker_files))  # Remove duplicates
 
 
 def load_single_ticker(args):
     """
     Helper function to load a single ticker's data file, suitable for multiprocessing.
-    
+
     Args:
         args (tuple): Tuple containing (ticker, data_dir, date_range)
             ticker (str): Ticker symbol
             data_dir (str): Directory with data files
             date_range (optional): Date range to filter data
-            
+
     Returns:
         tuple: (ticker, DataFrame or None)
     """
     ticker, data_dir, date_range = args
-    
+
     try:
         # Check for different file formats
-        extensions = ['.parquet', '.csv', '.csv.gz']
+        extensions = [".parquet", ".csv", ".csv.gz"]
         file_path = None
         file_format = None
-        
+
         for ext in extensions:
             possible_path = os.path.join(data_dir, f"{ticker}{ext}")
             if os.path.exists(possible_path):
                 file_path = possible_path
-                file_format = ext.lstrip('.')
+                file_format = ext.lstrip(".")
                 break
-                
+
         if file_path is None:
             logging.debug(f"No data file found for {ticker} in {data_dir}")
             return ticker, None
-            
+
         # Load based on file format
-        if file_format == 'parquet':
+        if file_format == "parquet":
             df = pd.read_parquet(file_path)
-        elif file_format in ['csv', 'csv.gz']:
-            if file_format == 'csv.gz':
-                df = pd.read_csv(file_path, compression='gzip')
+        elif file_format in ["csv", "csv.gz"]:
+            if file_format == "csv.gz":
+                df = pd.read_csv(file_path, compression="gzip")
             else:
                 df = pd.read_csv(file_path)
-            
+
             # Ensure the DataFrame has a DatetimeIndex - use first column as date
             first_col = df.columns[0]
             df.set_index(first_col, inplace=True)
@@ -2134,18 +2405,18 @@ def load_single_ticker(args):
         else:
             logging.warning(f"Unsupported file format: {file_format}")
             return ticker, None
-        
+
         # Ensure the index is a DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
-        
+
         # Sort the index to ensure chronological order
         df = df.sort_index()
-        
+
         if len(df) == 0:
             logging.warning(f"Loaded empty DataFrame for {ticker}")
             return ticker, None
-            
+
         # Apply date range filtering if needed
         if date_range is not None:
             if isinstance(date_range, pd.DatetimeIndex):
@@ -2155,9 +2426,9 @@ def load_single_ticker(args):
                 start_date, end_date = date_range
                 filtered_df = df.loc[start_date:end_date]
                 return ticker, filtered_df
-                
+
         return ticker, df
-        
+
     except Exception as e:
         logging.warning(f"Error loading data for {ticker}: {str(e)}")
         return ticker, None
