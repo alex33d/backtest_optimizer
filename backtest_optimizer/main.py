@@ -101,8 +101,6 @@ class ParameterOptimizer:
         self.file_prefix = save_file_prefix
         self.n_jobs = n_jobs
         self.data_info = {}  # Store metadata about data files (lengths, etc.)
-        self._file_cache = {}  # Cache for loaded files
-        self._cache_size_limit = 10  # Maximum number of files to keep in cache
         self.average_row_size_bytes = None
 
     def combcv_pl(
@@ -257,20 +255,6 @@ class ParameterOptimizer:
                 return -1e6
 
         return objective
-
-    def _clear_cache_if_needed(self):
-        """Clear the cache if it exceeds the size limit"""
-        if len(self._file_cache) > self._cache_size_limit:
-            # Keep only the most recently accessed items
-            # Sort by last_accessed timestamp
-            sorted_items = sorted(
-                self._file_cache.items(),
-                key=lambda x: x[1]["last_accessed"],
-                reverse=True,
-            )
-            # Keep only the top N items and clear the rest
-            keep_items = dict(sorted_items[: self._cache_size_limit])
-            self._file_cache = keep_items
 
     def collect_data_info(self, data_dir: str, file_pattern: str = None):
         """
@@ -557,7 +541,19 @@ class ParameterOptimizer:
 
         date_range_str = "all data"
         if date_range is not None:
-            if isinstance(date_range, pd.DatetimeIndex):
+            if isinstance(date_range, list):
+                # Handle list of date ranges (e.g., multiple DatetimeIndex objects)
+                date_ranges_info = []
+                for i, dr in enumerate(date_range[:2]):  # Just show first 2 ranges in log
+                    if isinstance(dr, pd.DatetimeIndex) and len(dr) > 0:
+                        date_ranges_info.append(f"{dr[0]} to {dr[-1]}")
+                if len(date_range) > 2:
+                    date_ranges_info.append(f"...and {len(date_range)-2} more")
+                date_range_str = ", ".join(date_ranges_info)
+                logging.debug(
+                    f"Loading {ticker} with multiple date ranges: {date_range_str}"
+                )
+            elif isinstance(date_range, pd.DatetimeIndex):
                 if len(date_range) > 0:
                     date_range_str = f"{date_range[0]} to {date_range[-1]}"
                     logging.debug(
@@ -572,33 +568,12 @@ class ParameterOptimizer:
         else:
             logging.debug(f"Loading all data for {ticker}")
 
-        if file_path in self._file_cache:
-            self._file_cache[file_path]["last_accessed"] = time.time()
-            df = self._file_cache[file_path]["data"]
-            logging.debug(f"Retrieved {ticker} from cache (size: {len(df)} rows)")
-
-            if date_range is not None:
-                if isinstance(date_range, pd.DatetimeIndex):
-                    filtered_df = df.loc[df.index.isin(date_range)]
-                    logging.debug(
-                        f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex"
-                    )
-                    return filtered_df
-                else:
-                    start_date, end_date = date_range
-                    filtered_df = df.loc[start_date:end_date]
-                    logging.debug(
-                        f"Filtered {ticker} to {len(filtered_df)} rows using range"
-                    )
-                    return filtered_df
-            return df
-
         try:
             logging.debug(f"Loading {ticker} from {file_path}")
             if file_format == "parquet":
                 if date_range is not None and not isinstance(
                     date_range, pd.DatetimeIndex
-                ):
+                ) and not isinstance(date_range, list):
                     df = pd.read_parquet(
                         file_path,
                         filters=[
@@ -617,7 +592,7 @@ class ParameterOptimizer:
                 )
                 if date_range is not None and not isinstance(
                     date_range, pd.DatetimeIndex
-                ):
+                ) and not isinstance(date_range, list):
                     df = pd.read_hdf(
                         file_path,
                         key=key,
@@ -651,11 +626,31 @@ class ParameterOptimizer:
                 logging.warning(f"Loaded empty DataFrame for {ticker}")
                 return df
 
-            self._file_cache[file_path] = {"data": df, "last_accessed": time.time()}
-            self._clear_cache_if_needed()
-
             if date_range is not None:
-                if isinstance(date_range, pd.DatetimeIndex):
+                if isinstance(date_range, list):
+                    # Handle list of DatetimeIndex objects
+                    all_indices = []
+                    for dr in date_range:
+                        if isinstance(dr, pd.DatetimeIndex) and len(dr) > 0:
+                            all_indices.extend(dr.tolist())
+                        elif isinstance(dr, tuple) and len(dr) == 2:
+                            # Handle tuple of (start, end) date ranges
+                            start_date, end_date = dr
+                            temp_idx = df.loc[start_date:end_date].index
+                            all_indices.extend(temp_idx.tolist())
+                    
+                    if not all_indices:
+                        logging.warning(f"No valid date ranges in list for {ticker}")
+                        return pd.DataFrame()
+                    
+                    # Create a DatetimeIndex from all collected dates
+                    combined_index = pd.DatetimeIndex(sorted(set(all_indices)))
+                    filtered_df = df.loc[df.index.isin(combined_index)]
+                    logging.debug(
+                        f"Filtered {ticker} to {len(filtered_df)} rows using multiple date ranges"
+                    )
+                    return filtered_df
+                elif isinstance(date_range, pd.DatetimeIndex):
                     filtered_df = df.loc[df.index.isin(date_range)]
                     logging.debug(
                         f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex"
@@ -962,14 +957,14 @@ class ParameterOptimizer:
 
     def estimate_memory_size(self, group_indices: dict, data_dir: str) -> float:
         """
-        Estimate the memory size (in MB) required for a fold's training data.
+        Estimate the memory size (in GB) required for a fold's training data.
 
         Args:
             group_indices (dict): Mapping of group numbers to ticker indices.
             data_dir (str): Directory containing data files.
 
         Returns:
-            float: Estimated memory size in MB.
+            float: Estimated memory size in GB.
         """
 
         if self.average_row_size_bytes is None:
@@ -991,9 +986,9 @@ class ParameterOptimizer:
 
         # Estimate memory with a 20% buffer
         total_memory_bytes = total_rows * self.average_row_size_bytes * 1.2
-        estimated_memory_mb = total_memory_bytes / (1024 * 1024)  # Convert to MB
-        logging.debug(f"Estimated {total_rows} rows, {estimated_memory_mb:.2f} MB")
-        return estimated_memory_mb
+        estimated_memory_gb = total_memory_bytes / (1024 * 1024 * 1024)  # Convert to GB
+        logging.debug(f"Estimated {total_rows} rows, {estimated_memory_gb:.2f} GB")
+        return estimated_memory_gb
 
     def optimize(
         self,
@@ -1034,7 +1029,7 @@ class ParameterOptimizer:
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
-        max_memory_mb = optimizer_params.get("max_memory_mb", 1000000)
+        max_memory_gb = optimizer_params.get("max_memory_gb", 1000)  # Default to 1000 GB (1 TB)
 
         # Collect data info instead of loading all data
         if not self.data_info:
@@ -1086,17 +1081,28 @@ class ParameterOptimizer:
 
             estimated_memory = self.estimate_memory_size(group_indices, data_dir)
             logging.info(
-                f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} MB"
+                f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} GB"
             )
 
-            if estimated_memory <= max_memory_mb:
+            if estimated_memory <= max_memory_gb:
                 logging.info(f"Preloading data for fold {fold_num}")
 
                 ticker_index_pairs = {}
                 for group_num, ticker_indices in group_indices.items():
                     for ticker, indices in ticker_indices.items():
-                        ticker_index_pairs[ticker] = indices
-
+                        # If the ticker already exists in ticker_index_pairs, we need to handle multiple indices
+                        if ticker in ticker_index_pairs:
+                            current_indices = ticker_index_pairs[ticker]
+                            if isinstance(current_indices, list):
+                                # Already a list, just append new indices
+                                current_indices.append(indices)
+                            else:
+                                # Convert to list with both the existing and new indices
+                                ticker_index_pairs[ticker] = [current_indices, indices]
+                        else:
+                            # First time seeing this ticker
+                            ticker_index_pairs[ticker] = indices
+            
                 n_workers = min(self.n_jobs, len(ticker_index_pairs), 32)
 
                 if n_workers <= 1:
@@ -1144,7 +1150,7 @@ class ParameterOptimizer:
                 data_source = train_data
             else:
                 logging.info(
-                    f"Memory limit ({max_memory_mb} MB) exceeded, loading per trial"
+                    f"Memory limit ({max_memory_gb} GB) exceeded, loading per trial"
                 )
                 data_source = data_dir
 
@@ -1332,9 +1338,6 @@ class ParameterOptimizer:
 
         logging.info("Plotting returns")
 
-        # Clear any existing cache
-        self._file_cache = {}
-
         # For plotting, we need to load all data
         if not self.data_info:
             self.collect_data_info(data_dir)
@@ -1472,9 +1475,6 @@ class ParameterOptimizer:
         if not self.data_info:
             self.collect_data_info(data_dir)
 
-        # Clear any existing cache
-        self._file_cache = {}
-
         if not self.all_tested_params:
             logging.warning("No tested parameters available for stress tests.")
             return
@@ -1559,9 +1559,6 @@ class ParameterOptimizer:
         # Collect data info if not already done
         if not self.data_info:
             self.collect_data_info(data_dir)
-
-        # Clear any existing cache
-        self._file_cache = {}
 
         arrays = list(self.backtest_paths.values())
         if not arrays:
@@ -1953,7 +1950,7 @@ class ParameterOptimizer:
             info["freq"] for info in self.data_info.values() if "freq" in info
         ]
         if not frequencies:
-            common_freq = "D"  # Default to daily if no frequencies found
+            common_freq = "min"  # Default to daily if no frequencies found
         else:
             from collections import Counter
 
