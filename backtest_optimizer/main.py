@@ -31,6 +31,8 @@ from functools import partial
 import logging
 import itertools as itt
 import gc
+import tempfile
+import shutil
 
 from backtest_stress_tests import run_stress_tests
 from metrics import *
@@ -528,7 +530,6 @@ class ParameterOptimizer:
                     file_path = possible_path
                     file_format = ext.lstrip(".")
                     break
-
             if file_path is None:
                 logging.debug(f"No data file found for {ticker} in {data_dir}")
                 return pd.DataFrame()
@@ -541,19 +542,7 @@ class ParameterOptimizer:
 
         date_range_str = "all data"
         if date_range is not None:
-            if isinstance(date_range, list):
-                # Handle list of date ranges (e.g., multiple DatetimeIndex objects)
-                date_ranges_info = []
-                for i, dr in enumerate(date_range[:2]):  # Just show first 2 ranges in log
-                    if isinstance(dr, pd.DatetimeIndex) and len(dr) > 0:
-                        date_ranges_info.append(f"{dr[0]} to {dr[-1]}")
-                if len(date_range) > 2:
-                    date_ranges_info.append(f"...and {len(date_range)-2} more")
-                date_range_str = ", ".join(date_ranges_info)
-                logging.debug(
-                    f"Loading {ticker} with multiple date ranges: {date_range_str}"
-                )
-            elif isinstance(date_range, pd.DatetimeIndex):
+            if isinstance(date_range, pd.DatetimeIndex):
                 if len(date_range) > 0:
                     date_range_str = f"{date_range[0]} to {date_range[-1]}"
                     logging.debug(
@@ -562,6 +551,12 @@ class ParameterOptimizer:
                 else:
                     logging.debug(f"Empty DatetimeIndex provided for {ticker}")
                     return pd.DataFrame()
+            elif isinstance(date_range, list):
+                all_dates = pd.concat([pd.Series(idx) for idx in date_range]).unique()
+                date_range_str = f"{min(all_dates)} to {max(all_dates)}"
+                logging.debug(
+                    f"Loading {ticker} with list of indices: {date_range_str}"
+                )
             else:
                 date_range_str = f"{date_range[0]} to {date_range[1]}"
                 logging.debug(f"Loading {ticker} with date range: {date_range_str}")
@@ -572,8 +567,8 @@ class ParameterOptimizer:
             logging.debug(f"Loading {ticker} from {file_path}")
             if file_format == "parquet":
                 if date_range is not None and not isinstance(
-                    date_range, pd.DatetimeIndex
-                ) and not isinstance(date_range, list):
+                    date_range, (pd.DatetimeIndex, list)
+                ):
                     df = pd.read_parquet(
                         file_path,
                         filters=[
@@ -583,7 +578,6 @@ class ParameterOptimizer:
                     )
                 else:
                     df = pd.read_parquet(file_path)
-
             elif file_format == "h5":
                 key = (
                     ticker
@@ -591,8 +585,8 @@ class ParameterOptimizer:
                     else "data"
                 )
                 if date_range is not None and not isinstance(
-                    date_range, pd.DatetimeIndex
-                ) and not isinstance(date_range, list):
+                    date_range, (pd.DatetimeIndex, list)
+                ):
                     df = pd.read_hdf(
                         file_path,
                         key=key,
@@ -600,7 +594,6 @@ class ParameterOptimizer:
                     )
                 else:
                     df = pd.read_hdf(file_path, key=key)
-
             elif file_format in ["csv", "csv.gz"]:
                 if file_format == "csv.gz":
                     df = pd.read_csv(file_path, compression="gzip")
@@ -609,7 +602,6 @@ class ParameterOptimizer:
                 first_col = df.columns[0]
                 df.set_index(first_col, inplace=True)
                 df.index = pd.to_datetime(df.index)
-
             else:
                 logging.warning(f"Unsupported file format: {file_format}")
                 return pd.DataFrame()
@@ -638,11 +630,11 @@ class ParameterOptimizer:
                             start_date, end_date = dr
                             temp_idx = df.loc[start_date:end_date].index
                             all_indices.extend(temp_idx.tolist())
-                    
+
                     if not all_indices:
                         logging.warning(f"No valid date ranges in list for {ticker}")
                         return pd.DataFrame()
-                    
+
                     # Create a DatetimeIndex from all collected dates
                     combined_index = pd.DatetimeIndex(sorted(set(all_indices)))
                     filtered_df = df.loc[df.index.isin(combined_index)]
@@ -1029,7 +1021,9 @@ class ParameterOptimizer:
         result = []
         self.params_dict = params.copy()
         all_tested_params = []
-        max_memory_gb = optimizer_params.get("max_memory_gb", 1000)  # Default to 1000 GB (1 TB)
+        max_memory_gb = optimizer_params.get(
+            "max_memory_gb", 1000
+        )  # Default to 1000 GB (1 TB)
 
         # Collect data info instead of loading all data
         if not self.data_info:
@@ -1079,6 +1073,16 @@ class ParameterOptimizer:
             # Generate indices before optimization
             group_indices = self.generate_group_indices(is_train=True)
 
+            ticker_index_pairs = {}
+            for group_num, ticker_indices in group_indices.items():
+                for ticker, indices in ticker_indices.items():
+                    if ticker not in ticker_index_pairs:
+                        ticker_index_pairs[ticker] = []
+                    if isinstance(indices, list):
+                        ticker_index_pairs[ticker].extend(indices)
+                    else:
+                        ticker_index_pairs[ticker].append(indices)
+
             estimated_memory = self.estimate_memory_size(group_indices, data_dir)
             logging.info(
                 f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} GB"
@@ -1087,22 +1091,6 @@ class ParameterOptimizer:
             if estimated_memory <= max_memory_gb:
                 logging.info(f"Preloading data for fold {fold_num}")
 
-                ticker_index_pairs = {}
-                for group_num, ticker_indices in group_indices.items():
-                    for ticker, indices in ticker_indices.items():
-                        # If the ticker already exists in ticker_index_pairs, we need to handle multiple indices
-                        if ticker in ticker_index_pairs:
-                            current_indices = ticker_index_pairs[ticker]
-                            if isinstance(current_indices, list):
-                                # Already a list, just append new indices
-                                current_indices.append(indices)
-                            else:
-                                # Convert to list with both the existing and new indices
-                                ticker_index_pairs[ticker] = [current_indices, indices]
-                        else:
-                            # First time seeing this ticker
-                            ticker_index_pairs[ticker] = indices
-            
                 n_workers = min(self.n_jobs, len(ticker_index_pairs), 32)
 
                 if n_workers <= 1:
@@ -1149,10 +1137,26 @@ class ParameterOptimizer:
 
                 data_source = train_data
             else:
-                logging.info(
-                    f"Memory limit ({max_memory_gb} GB) exceeded, loading per trial"
-                )
-                data_source = data_dir
+                if all(
+                    info["format"] in ["csv", "csv.gz"]
+                    for info in self.data_info.values()
+                ):
+                    logging.info(f"Converting CSV to HDF5 for fold {fold_num}")
+                    temp_dir = tempfile.mkdtemp()
+                    try:
+                        for ticker, indices in ticker_index_pairs.items():
+                            df = self.load_ticker_data(
+                                ticker, date_range=indices, data_dir=data_dir
+                            )
+                            if not df.empty:
+                                h5_path = os.path.join(temp_dir, f"{ticker}.h5")
+                                df.to_hdf(h5_path, key="data", mode="w")
+                        data_source = temp_dir
+                    except Exception as e:
+                        logging.error(f"Failed to convert CSV to HDF5: {e}")
+                        data_source = data_dir
+                else:
+                    data_source = data_dir
 
             # Define the objective function using combcv_pl
             objective_func = self.create_objective(
@@ -1256,6 +1260,9 @@ class ParameterOptimizer:
                 )
                 interim_df.to_csv(interim_file, index=False)
                 logging.info(f"Interim results saved to {interim_file}")
+
+            if "temp_dir" in locals():
+                shutil.rmtree(temp_dir)
 
             fold_duration = time.time() - fold_start_time
             logging.info(f"Completed fold {fold_num} in {fold_duration:.2f}s")
