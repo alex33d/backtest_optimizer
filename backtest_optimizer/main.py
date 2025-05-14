@@ -135,7 +135,7 @@ class ParameterOptimizer:
                 if isinstance(data_source, str):
                     # Load data from directory for specific date ranges
                     # Let load_ticker_data handle all the data loading logging
-                    df = self.load_ticker_data(ticker, date_range=indices)
+                    df = self.load_ticker_data(ticker, date_range=indices, data_dir=data_source)
                     if not df.empty:
                         group_data[ticker] = df
                     else:
@@ -154,10 +154,6 @@ class ParameterOptimizer:
                     if isinstance(indices, pd.DatetimeIndex):
                         # DatetimeIndex case
                         mask = df.index.isin(indices)
-                        rows_count = mask.sum()
-                        logging.debug(
-                            f"Group {group_num}: Filtering {ticker} with DatetimeIndex, matched {rows_count} rows"
-                        )
                         group_data[ticker] = df.loc[mask]
                     else:
                         # Integer indices case (legacy)
@@ -987,11 +983,6 @@ class ParameterOptimizer:
         data_dir: str,
         params: dict,
         optimizer_params: dict,
-        n_runs: int,
-        best_trials_pct: float,
-        n_splits: int = None,
-        n_test_splits: int = None,
-        train_test_date: str = None,
     ):
         """
         Optimize parameters using combinatorial cross-validation.
@@ -1012,7 +1003,7 @@ class ParameterOptimizer:
         # Log optimization parameters
         param_keys_to_optimize = [k for k, v in params.items() if isinstance(v, list)]
         logging.info(
-            f"Starting optimization with {n_runs} trials per fold and {len(param_keys_to_optimize)} parameters to optimize"
+            f"Starting optimization with {optimizer_params.get('n_runs')} trials per fold and {len(param_keys_to_optimize)} parameters to optimize"
         )
         if param_keys_to_optimize:
             logging.info(f"Parameters to optimize: {param_keys_to_optimize}")
@@ -1035,9 +1026,9 @@ class ParameterOptimizer:
             )
 
         # If train_test_date is provided, limit max date in data_info
-        if train_test_date is not None:
-            train_test_datetime = pd.Timestamp(train_test_date)
-            logging.info(f"Limiting data to before {train_test_date}")
+        if optimizer_params.get("train_test_date") is not None:
+            train_test_datetime = pd.Timestamp(optimizer_params["train_test_date"])
+            logging.info(f"Limiting data to before {optimizer_params['train_test_date']}")
 
             # Update data_info to limit end_date to train_test_date
             for ticker in self.data_info:
@@ -1048,13 +1039,13 @@ class ParameterOptimizer:
         self.params_dict["data_path"] = data_dir
 
         # Check if n_splits and n_test_splits are provided
-        if n_splits is None or n_test_splits is None:
+        if optimizer_params.get("n_splits") is None or optimizer_params.get("n_test_splits") is None:
             raise ValueError("n_splits and n_test_splits must be provided")
 
         # Create combinatorial splits based on data info
         splits_start = time.time()
         self.create_date_combcv_dict(
-            data_dir, n_splits=n_splits, n_test_splits=n_test_splits
+            data_dir, n_splits=optimizer_params.get("n_splits"), n_test_splits=optimizer_params.get("n_test_splits")
         )
         splits_duration = time.time() - splits_start
         logging.info(
@@ -1175,8 +1166,8 @@ class ParameterOptimizer:
             )
 
             # Run the optimization
-            logging.info(f"Running {n_runs} trials for fold {fold_num}")
-            study.optimize(objective_func, n_trials=n_runs, n_jobs=self.n_jobs)
+            logging.info(f"Running {optimizer_params.get('n_runs')} trials for fold {fold_num}")
+            study.optimize(objective_func, n_trials=optimizer_params.get('n_runs'), n_jobs=self.n_jobs)
             optimization_duration = time.time() - fold_start_time
 
             # Process and sort trials
@@ -1193,7 +1184,7 @@ class ParameterOptimizer:
 
             completed_trials = len(all_trials)
             logging.info(
-                f"Fold {fold_num}: {completed_trials}/{n_runs} trials completed in {optimization_duration:.2f}s"
+                f"Fold {fold_num}: {completed_trials}/{optimizer_params.get('n_runs')} trials completed in {optimization_duration:.2f}s"
             )
 
             if completed_trials == 0:
@@ -1213,7 +1204,7 @@ class ParameterOptimizer:
             all_tested_params.extend(all_trials)
 
             # Select top parameters based on percentage
-            top_count = max(1, int(len(all_trials) * best_trials_pct))
+            top_count = max(1, int(len(all_trials) * optimizer_params.get('best_trials_pct')))
             top_params = all_trials[:top_count]
             logging.info(
                 f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})"
