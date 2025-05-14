@@ -33,6 +33,7 @@ import itertools as itt
 import gc
 import tempfile
 import shutil
+import pyarrow.parquet as pq
 
 from backtest_stress_tests import run_stress_tests
 from metrics import *
@@ -135,7 +136,9 @@ class ParameterOptimizer:
                 if isinstance(data_source, str):
                     # Load data from directory for specific date ranges
                     # Let load_ticker_data handle all the data loading logging
-                    df = self.load_ticker_data(ticker, date_range=indices, data_dir=data_source)
+                    df = self.load_ticker_data(
+                        ticker, date_range=indices, data_dir=data_source
+                    )
                     if not df.empty:
                         group_data[ticker] = df
                     else:
@@ -561,33 +564,128 @@ class ParameterOptimizer:
 
         try:
             logging.debug(f"Loading {ticker} from {file_path}")
-            if file_format == "parquet":
-                if date_range is not None and not isinstance(
-                    date_range, (pd.DatetimeIndex, list)
-                ):
-                    df = pd.read_parquet(
-                        file_path,
-                        filters=[
-                            ("index", ">=", date_range[0]),
-                            ("index", "<=", date_range[1]),
-                        ],
-                    )
+
+            # Helper function to convert date_range into a list of (start, end) tuples
+            def parse_date_ranges(date_range):
+                if date_range is None:
+                    return None
+                elif isinstance(date_range, tuple) and len(date_range) == 2:
+                    return [
+                        (pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]))
+                    ]
+                elif isinstance(date_range, pd.DatetimeIndex):
+                    # Group consecutive dates into ranges
+                    dates = sorted(date_range)
+                    ranges = []
+                    start = dates[0]
+                    prev = start
+                    for curr in dates[1:] + [None]:
+                        if curr is None or (curr - prev).days > 1:
+                            ranges.append((start, prev))
+                            start = curr
+                        prev = curr if curr is not None else prev
+                    return ranges
+                elif isinstance(date_range, list):
+                    # Flatten list of DatetimeIndex or tuples into ranges
+                    all_ranges = []
+                    for item in date_range:
+                        if isinstance(item, pd.DatetimeIndex):
+                            all_ranges.extend(parse_date_ranges(item))
+                        elif isinstance(item, tuple) and len(item) == 2:
+                            all_ranges.append(
+                                (pd.to_datetime(item[0]), pd.to_datetime(item[1]))
+                            )
+                    return all_ranges
                 else:
-                    df = pd.read_parquet(file_path)
-            elif file_format == "h5":
-                key = (
-                    ticker
-                    if ticker in pd.read_hdf(file_path, mode="r").keys()
-                    else "data"
-                )
-                if date_range is not None and not isinstance(
-                    date_range, (pd.DatetimeIndex, list)
-                ):
-                    df = pd.read_hdf(
-                        file_path,
-                        key=key,
-                        where="index >= @date_range[0] and index <= @date_range[1]",
+                    raise ValueError(f"Unsupported date_range type: {type(date_range)}")
+
+            def find_datetime_column(file_path):
+                possible_names = [
+                    "index",
+                    "date",
+                    "time",
+                    "datetime",
+                    "timestamp",
+                    "Index",
+                    "Date",
+                    "Time",
+                    "Datetime",
+                    "Timestamp",
+                ]
+                try:
+                    # Read Parquet metadata using pyarrow
+                    parquet_file = pq.ParquetFile(file_path)
+                    schema = parquet_file.schema
+                    for i in range(len(schema)):
+                        col_name = schema[i].name
+                        col_type = str(schema[i].physical_type).lower()
+                        # Check if the column is a timestamp type or has a matching name
+                        if (
+                            col_type.startswith("timestamp")
+                            or col_name in possible_names
+                        ):
+                            return col_name
+                    return None
+                except Exception as e:
+                    logging.warning(
+                        f"Error reading Parquet schema for {file_path}: {e}"
                     )
+                    return None
+
+            # Parse the date ranges to load
+            ranges = parse_date_ranges(date_range) if date_range is not None else None
+
+            # Load data based on file format
+            if file_format == "parquet":
+                datetime_column = find_datetime_column(file_path)
+                if datetime_column is None:
+                    logging.warning(
+                        f"No suitable datetime column found for {ticker}. Loading full file."
+                    )
+                    df = pd.read_parquet(file_path)
+                else:
+                    if ranges:
+                        dfs = []
+                        for start_date, end_date in ranges:
+                            try:
+                                df_part = pd.read_parquet(
+                                    file_path,
+                                    filters=[
+                                        (datetime_column, ">=", start_date),
+                                        (datetime_column, "<=", end_date),
+                                    ],
+                                )
+                                dfs.append(df_part)
+                            except Exception as e:
+                                logging.warning(
+                                    f"Failed to load Parquet part for {ticker} ({start_date} to {end_date}): {e}"
+                                )
+                                continue
+                        df = pd.concat(dfs) if dfs else pd.DataFrame()
+                        if datetime_column in df.columns:
+                            df.set_index(datetime_column, inplace=True)
+                    else:
+                        df = pd.read_parquet(file_path)
+                        if datetime_column in df.columns:
+                            df.set_index(datetime_column, inplace=True)
+            elif file_format == "h5":
+                key = "data"
+                if ranges:
+                    dfs = []
+                    for start_date, end_date in ranges:
+                        try:
+                            df_part = pd.read_hdf(
+                                file_path,
+                                key=key,
+                                where=f"index >= '{start_date}' and index <= '{end_date}'",
+                            )
+                            dfs.append(df_part)
+                        except Exception as e:
+                            logging.warning(
+                                f"Failed to load HDF5 part for {ticker} ({start_date} to {end_date}): {e}"
+                            )
+                            continue
+                    df = pd.concat(dfs) if dfs else pd.DataFrame()
                 else:
                     df = pd.read_hdf(file_path, key=key)
             elif file_format in ["csv", "csv.gz"]:
@@ -598,61 +696,30 @@ class ParameterOptimizer:
                 first_col = df.columns[0]
                 df.set_index(first_col, inplace=True)
                 df.index = pd.to_datetime(df.index)
+                if ranges:
+                    masks = [
+                        (df.index >= start) & (df.index <= end) for start, end in ranges
+                    ]
+                    combined_mask = masks[0]
+                    for mask in masks[1:]:
+                        combined_mask |= mask
+                    df = df.loc[combined_mask]
             else:
                 logging.warning(f"Unsupported file format: {file_format}")
                 return pd.DataFrame()
 
+            # Ensure index is DatetimeIndex and sorted
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
-
             df = df.sort_index()
+
             if len(df) > 0:
                 logging.debug(
                     f"Loaded {ticker}: {len(df)} rows, range: {df.index[0]} to {df.index[-1]}"
                 )
             else:
                 logging.warning(f"Loaded empty DataFrame for {ticker}")
-                return df
-
-            if date_range is not None:
-                if isinstance(date_range, list):
-                    # Handle list of DatetimeIndex objects
-                    all_indices = []
-                    for dr in date_range:
-                        if isinstance(dr, pd.DatetimeIndex) and len(dr) > 0:
-                            all_indices.extend(dr.tolist())
-                        elif isinstance(dr, tuple) and len(dr) == 2:
-                            # Handle tuple of (start, end) date ranges
-                            start_date, end_date = dr
-                            temp_idx = df.loc[start_date:end_date].index
-                            all_indices.extend(temp_idx.tolist())
-
-                    if not all_indices:
-                        logging.warning(f"No valid date ranges in list for {ticker}")
-                        return pd.DataFrame()
-
-                    # Create a DatetimeIndex from all collected dates
-                    combined_index = pd.DatetimeIndex(sorted(set(all_indices)))
-                    filtered_df = df.loc[df.index.isin(combined_index)]
-                    logging.debug(
-                        f"Filtered {ticker} to {len(filtered_df)} rows using multiple date ranges"
-                    )
-                    return filtered_df
-                elif isinstance(date_range, pd.DatetimeIndex):
-                    filtered_df = df.loc[df.index.isin(date_range)]
-                    logging.debug(
-                        f"Filtered {ticker} to {len(filtered_df)} rows using DatetimeIndex"
-                    )
-                    return filtered_df
-                else:
-                    start_date, end_date = date_range
-                    filtered_df = df.loc[start_date:end_date]
-                    logging.debug(
-                        f"Filtered {ticker} to {len(filtered_df)} rows using range"
-                    )
-                    return filtered_df
             return df
-
         except Exception as e:
             logging.warning(f"Error loading data for {ticker}: {str(e)}")
             return pd.DataFrame()
@@ -913,6 +980,113 @@ class ParameterOptimizer:
 
         return group_indices
 
+    def load_data_for_indices(
+        self,
+        group_indices: dict,
+        data_dir: str,
+        estimated_memory: float,
+        max_memory_gb: float,
+        fold_num: int = None,
+    ):
+        """
+        Load data for the given group indices.
+
+        Args:
+            group_indices (dict): Mapping of group numbers to ticker indices.
+            data_dir (str): Directory containing data files.
+            estimated_memory (float): Estimated memory for entire fold
+            max_memory_gb (float): Max allowed amount of RAM
+            fold_num (int): number of fold for train
+
+        Returns:
+            data_source (str or dict): Data source with desired indices
+        """
+        ticker_index_pairs = {}
+        for group_num, ticker_indices in group_indices.items():
+            for ticker, indices in ticker_indices.items():
+                if ticker not in ticker_index_pairs:
+                    ticker_index_pairs[ticker] = []
+                if isinstance(indices, list):
+                    ticker_index_pairs[ticker].extend(indices)
+                else:
+                    ticker_index_pairs[ticker].append(indices)
+
+        fold_or_test = f"Fold {fold_num}" if fold_num is not None else "Test"
+        if estimated_memory <= max_memory_gb:
+            logging.info(f"Preloading data for {fold_or_test}")
+
+            n_workers = min(self.n_jobs, len(ticker_index_pairs), 32)
+
+            if n_workers <= 1:
+                data = {}
+                for ticker, indices in tqdm(
+                    ticker_index_pairs.items(), desc="Loading ticker data"
+                ):
+                    df = self.load_ticker_data(
+                        ticker, date_range=indices, data_dir=data_dir
+                    )
+                    if df is not None and not df.empty:
+                        data[ticker] = df
+            else:
+                logging.info(
+                    f"Loading {len(ticker_index_pairs)} tickers using {n_workers} parallel workers"
+                )
+
+                from multiprocessing import Pool
+
+                def _load_single_ticker(args):
+                    ticker, indices, data_dir = args
+                    df = self.load_ticker_data(
+                        ticker, date_range=indices, data_dir=data_dir
+                    )
+                    return ticker, df
+
+                load_args = [
+                    (ticker, indices, data_dir)
+                    for ticker, indices in ticker_index_pairs.items()
+                ]
+                with Pool(processes=n_workers) as pool:
+                    results = list(
+                        tqdm(
+                            pool.imap(_load_single_ticker, load_args),
+                            total=len(load_args),
+                            desc="Loading ticker data",
+                        )
+                    )
+
+                data = {}
+                for ticker, df in results:
+                    if df is not None and not df.empty:
+                        data[ticker] = df
+
+            return data
+        else:
+            if all(
+                info["format"] in ["csv", "csv.gz"] for info in self.data_info.values()
+            ):
+                logging.info(f"Converting CSV to HDF5 for {fold_or_test}")
+                temp_dir = tempfile.mkdtemp()
+                try:
+                    for ticker, indices in ticker_index_pairs.items():
+                        df = self.load_ticker_data(
+                            ticker, date_range=indices, data_dir=data_dir
+                        )
+                        if not df.empty:
+                            h5_path = os.path.join(temp_dir, f"{ticker}.h5")
+                            df.to_hdf(
+                                h5_path,
+                                key="data",
+                                mode="w",
+                                format="table",
+                                data_columns=True,
+                            )
+                    return temp_dir
+                except Exception as e:
+                    logging.error(f"Failed to convert CSV to HDF5: {e}")
+                    return data_dir
+            else:
+                return data_dir
+
     def calculate_average_row_size(
         self, data_dir: str, sample_ticker: str, sample_date_range: tuple
     ) -> float:
@@ -1028,7 +1202,9 @@ class ParameterOptimizer:
         # If train_test_date is provided, limit max date in data_info
         if optimizer_params.get("train_test_date") is not None:
             train_test_datetime = pd.Timestamp(optimizer_params["train_test_date"])
-            logging.info(f"Limiting data to before {optimizer_params['train_test_date']}")
+            logging.info(
+                f"Limiting data to before {optimizer_params['train_test_date']}"
+            )
 
             # Update data_info to limit end_date to train_test_date
             for ticker in self.data_info:
@@ -1039,13 +1215,18 @@ class ParameterOptimizer:
         self.params_dict["data_path"] = data_dir
 
         # Check if n_splits and n_test_splits are provided
-        if optimizer_params.get("n_splits") is None or optimizer_params.get("n_test_splits") is None:
+        if (
+            optimizer_params.get("n_splits") is None
+            or optimizer_params.get("n_test_splits") is None
+        ):
             raise ValueError("n_splits and n_test_splits must be provided")
 
         # Create combinatorial splits based on data info
         splits_start = time.time()
         self.create_date_combcv_dict(
-            data_dir, n_splits=optimizer_params.get("n_splits"), n_test_splits=optimizer_params.get("n_test_splits")
+            data_dir,
+            n_splits=optimizer_params.get("n_splits"),
+            n_test_splits=optimizer_params.get("n_test_splits"),
         )
         splits_duration = time.time() - splits_start
         logging.info(
@@ -1064,90 +1245,14 @@ class ParameterOptimizer:
             # Generate indices before optimization
             group_indices = self.generate_group_indices(is_train=True)
 
-            ticker_index_pairs = {}
-            for group_num, ticker_indices in group_indices.items():
-                for ticker, indices in ticker_indices.items():
-                    if ticker not in ticker_index_pairs:
-                        ticker_index_pairs[ticker] = []
-                    if isinstance(indices, list):
-                        ticker_index_pairs[ticker].extend(indices)
-                    else:
-                        ticker_index_pairs[ticker].append(indices)
-
             estimated_memory = self.estimate_memory_size(group_indices, data_dir)
             logging.info(
                 f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} GB"
             )
 
-            if estimated_memory <= max_memory_gb:
-                logging.info(f"Preloading data for fold {fold_num}")
-
-                n_workers = min(self.n_jobs, len(ticker_index_pairs), 32)
-
-                if n_workers <= 1:
-                    train_data = {}
-                    for ticker, indices in tqdm(
-                        ticker_index_pairs.items(), desc="Loading ticker data"
-                    ):
-                        df = self.load_ticker_data(
-                            ticker, date_range=indices, data_dir=data_dir
-                        )
-                        if df is not None and not df.empty:
-                            train_data[ticker] = df
-                else:
-                    logging.info(
-                        f"Loading {len(ticker_index_pairs)} tickers using {n_workers} parallel workers"
-                    )
-
-                    from multiprocessing import Pool
-
-                    def _load_single_ticker(args):
-                        ticker, indices, data_dir = args
-                        df = self.load_ticker_data(
-                            ticker, date_range=indices, data_dir=data_dir
-                        )
-                        return ticker, df
-
-                    load_args = [
-                        (ticker, indices, data_dir)
-                        for ticker, indices in ticker_index_pairs.items()
-                    ]
-                    with Pool(processes=n_workers) as pool:
-                        results = list(
-                            tqdm(
-                                pool.imap(_load_single_ticker, load_args),
-                                total=len(load_args),
-                                desc="Loading ticker data",
-                            )
-                        )
-
-                    train_data = {}
-                    for ticker, df in results:
-                        if df is not None and not df.empty:
-                            train_data[ticker] = df
-
-                data_source = train_data
-            else:
-                if all(
-                    info["format"] in ["csv", "csv.gz"]
-                    for info in self.data_info.values()
-                ):
-                    logging.info(f"Converting CSV to HDF5 for fold {fold_num}")
-                    temp_dir = tempfile.mkdtemp()
-                    try:
-                        for ticker, indices in ticker_index_pairs.items():
-                            df = self.load_ticker_data(
-                                ticker, date_range=indices, data_dir=data_dir
-                            )
-                            if not df.empty:
-                                h5_path = os.path.join(temp_dir, f"{ticker}.h5")
-                                df.to_hdf(h5_path, key="data", mode="w")
-                        data_source = temp_dir
-                    except Exception as e:
-                        logging.error(f"Failed to convert CSV to HDF5: {e}")
-                        data_source = data_dir
-                else:
-                    data_source = data_dir
+            data_source = self.load_data_for_indices(
+                group_indices, data_dir, estimated_memory, max_memory_gb, fold_num
+            )
 
             # Define the objective function using combcv_pl
             objective_func = self.create_objective(
@@ -1166,9 +1271,18 @@ class ParameterOptimizer:
             )
 
             # Run the optimization
-            logging.info(f"Running {optimizer_params.get('n_runs')} trials for fold {fold_num}")
-            study.optimize(objective_func, n_trials=optimizer_params.get('n_runs'), n_jobs=self.n_jobs)
+            logging.info(
+                f"Running {optimizer_params.get('n_runs')} trials for fold {fold_num}"
+            )
+            study.optimize(
+                objective_func,
+                n_trials=optimizer_params.get("n_runs"),
+                n_jobs=self.n_jobs,
+            )
             optimization_duration = time.time() - fold_start_time
+
+            if "train_data" in locals():
+                del train_data
 
             # Process and sort trials
             all_trials = sorted(
@@ -1204,7 +1318,9 @@ class ParameterOptimizer:
             all_tested_params.extend(all_trials)
 
             # Select top parameters based on percentage
-            top_count = max(1, int(len(all_trials) * optimizer_params.get('best_trials_pct')))
+            top_count = max(
+                1, int(len(all_trials) * optimizer_params.get("best_trials_pct"))
+            )
             top_params = all_trials[:top_count]
             logging.info(
                 f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})"
@@ -1212,12 +1328,16 @@ class ParameterOptimizer:
 
             # Generate test indices
             test_indices = self.generate_group_indices(is_train=False)
+            estimated_memory = self.estimate_memory_size(test_indices, data_dir)
+            test_data = self.load_data_for_indices(
+                test_indices, data_dir, estimated_memory, max_memory_gb
+            )
 
             # Evaluate top parameters on validation data
             evaluation_start = time.time()
             for i, trial_params in enumerate(top_params):
                 sharpe, _ = self.combcv_pl(
-                    trial_params, test_indices, self.calc_pl, data_dir
+                    trial_params, test_indices, self.calc_pl, test_data
                 )
 
                 # Record results
