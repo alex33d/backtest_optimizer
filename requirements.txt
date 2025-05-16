@@ -6,3 +6,5 @@ matplotlib
 scipy
 joblib
 statsmodels
+pyarrow
+tqdm

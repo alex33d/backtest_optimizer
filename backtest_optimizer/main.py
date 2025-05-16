@@ -984,7 +984,6 @@ class ParameterOptimizer:
         self,
         group_indices: dict,
         data_dir: str,
-        estimated_memory: float,
         max_memory_gb: float,
         fold_num: int = None,
     ):
@@ -994,13 +993,37 @@ class ParameterOptimizer:
         Args:
             group_indices (dict): Mapping of group numbers to ticker indices.
             data_dir (str): Directory containing data files.
-            estimated_memory (float): Estimated memory for entire fold
             max_memory_gb (float): Max allowed amount of RAM
             fold_num (int): number of fold for train
 
         Returns:
             data_source (str or dict): Data source with desired indices
         """
+
+        fold_or_test = f"Fold {fold_num}" if fold_num is not None else "Test"
+
+        if self.average_row_size_bytes is None:
+            sample_ticker = list(self.data_info.keys())[0]
+            sample_start = self.data_info[sample_ticker]["start_date"]
+            sample_end = sample_start + pd.Timedelta(days=10)
+            sample_date_range = (sample_start, sample_end)
+            self.average_row_size_bytes = self.calculate_average_row_size(
+                data_dir, sample_ticker, sample_date_range
+            )
+
+        total_rows = 0
+        for group_num, ticker_indices in group_indices.items():
+            for ticker, indices in ticker_indices.items():
+                if isinstance(indices, list):
+                    total_rows += sum(len(chunk) for chunk in indices)
+                else:
+                    total_rows += len(indices)
+
+        # Estimate memory with a 20% buffer
+        total_memory_bytes = total_rows * self.average_row_size_bytes * 1.2
+        estimated_memory = total_memory_bytes / (1024 * 1024 * 1024)  # Convert to GB
+        logging.info(f"{fold_or_test}: Estimated memory: {estimated_memory:.2f} GB")
+
         ticker_index_pairs = {}
         for group_num, ticker_indices in group_indices.items():
             for ticker, indices in ticker_indices.items():
@@ -1011,7 +1034,6 @@ class ParameterOptimizer:
                 else:
                     ticker_index_pairs[ticker].append(indices)
 
-        fold_or_test = f"Fold {fold_num}" if fold_num is not None else "Test"
         if estimated_memory <= max_memory_gb:
             logging.info(f"Preloading data for {fold_or_test}")
 
@@ -1034,15 +1056,8 @@ class ParameterOptimizer:
 
                 from multiprocessing import Pool
 
-                def _load_single_ticker(args):
-                    ticker, indices, data_dir = args
-                    df = self.load_ticker_data(
-                        ticker, date_range=indices, data_dir=data_dir
-                    )
-                    return ticker, df
-
                 load_args = [
-                    (ticker, indices, data_dir)
+                    (self, ticker, indices, data_dir)
                     for ticker, indices in ticker_index_pairs.items()
                 ]
                 with Pool(processes=n_workers) as pool:
@@ -1067,20 +1082,27 @@ class ParameterOptimizer:
                 logging.info(f"Converting CSV to HDF5 for {fold_or_test}")
                 temp_dir = tempfile.mkdtemp()
                 try:
-                    for ticker, indices in ticker_index_pairs.items():
-                        df = self.load_ticker_data(
-                            ticker, date_range=indices, data_dir=data_dir
-                        )
-                        if not df.empty:
-                            h5_path = os.path.join(temp_dir, f"{ticker}.h5")
-                            df.to_hdf(
-                                h5_path,
-                                key="data",
-                                mode="w",
-                                format="table",
-                                data_columns=True,
+                    from multiprocessing import Pool
+
+                    conversion_args = [
+                        (self, ticker, indices, data_dir, temp_dir)
+                        for ticker, indices in ticker_index_pairs.items()
+                    ]
+                    with Pool(processes=self.n_jobs) as pool:
+                        results = list(
+                            tqdm(
+                                pool.imap(convert_to_hdf5, conversion_args),
+                                total=len(conversion_args),
+                                desc="Converting to HDF5",
                             )
-                    return temp_dir
+                        )
+                    if all(results):
+                        return temp_dir
+                    else:
+                        logging.error(
+                            "Some conversions failed. Falling back to original data directory."
+                        )
+                        return data_dir
                 except Exception as e:
                     logging.error(f"Failed to convert CSV to HDF5: {e}")
                     return data_dir
@@ -1116,41 +1138,6 @@ class ParameterOptimizer:
             f"Average row size for {sample_ticker}: {average_row_size:.2f} bytes"
         )
         return average_row_size
-
-    def estimate_memory_size(self, group_indices: dict, data_dir: str) -> float:
-        """
-        Estimate the memory size (in GB) required for a fold's training data.
-
-        Args:
-            group_indices (dict): Mapping of group numbers to ticker indices.
-            data_dir (str): Directory containing data files.
-
-        Returns:
-            float: Estimated memory size in GB.
-        """
-
-        if self.average_row_size_bytes is None:
-            sample_ticker = list(self.data_info.keys())[0]
-            sample_start = self.data_info[sample_ticker]["start_date"]
-            sample_end = sample_start + pd.Timedelta(days=10)
-            sample_date_range = (sample_start, sample_end)
-            self.average_row_size_bytes = self.calculate_average_row_size(
-                data_dir, sample_ticker, sample_date_range
-            )
-
-        total_rows = 0
-        for group_num, ticker_indices in group_indices.items():
-            for ticker, indices in ticker_indices.items():
-                if isinstance(indices, list):
-                    total_rows += sum(len(chunk) for chunk in indices)
-                else:
-                    total_rows += len(indices)
-
-        # Estimate memory with a 20% buffer
-        total_memory_bytes = total_rows * self.average_row_size_bytes * 1.2
-        estimated_memory_gb = total_memory_bytes / (1024 * 1024 * 1024)  # Convert to GB
-        logging.debug(f"Estimated {total_rows} rows, {estimated_memory_gb:.2f} GB")
-        return estimated_memory_gb
 
     def optimize(
         self,
@@ -1245,13 +1232,8 @@ class ParameterOptimizer:
             # Generate indices before optimization
             group_indices = self.generate_group_indices(is_train=True)
 
-            estimated_memory = self.estimate_memory_size(group_indices, data_dir)
-            logging.info(
-                f"Fold {fold_num}: Estimated memory: {estimated_memory:.2f} GB"
-            )
-
             data_source = self.load_data_for_indices(
-                group_indices, data_dir, estimated_memory, max_memory_gb, fold_num
+                group_indices, data_dir, max_memory_gb, fold_num
             )
 
             # Define the objective function using combcv_pl
@@ -1328,9 +1310,8 @@ class ParameterOptimizer:
 
             # Generate test indices
             test_indices = self.generate_group_indices(is_train=False)
-            estimated_memory = self.estimate_memory_size(test_indices, data_dir)
             test_data = self.load_data_for_indices(
-                test_indices, data_dir, estimated_memory, max_memory_gb
+                test_indices, data_dir, max_memory_gb
             )
 
             # Evaluate top parameters on validation data
@@ -2223,6 +2204,26 @@ class ParameterOptimizer:
         return data_dict
 
 
+def convert_to_hdf5(args):
+    optimizer, ticker, indices, data_dir, temp_dir = args
+    try:
+        df = optimizer.load_ticker_data(ticker, date_range=indices, data_dir=data_dir)
+        if not df.empty:
+            h5_path = os.path.join(temp_dir, f"{ticker}.h5")
+            df.to_hdf(
+                h5_path,
+                key="data",
+                mode="w",
+                format="table",
+                data_columns=True,
+            )
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error converting {ticker} to HDF5: {str(e)}")
+        return False
+
+
 def process_combination(
     combination, data_dir, param_names, calc_pl=None, calculate_metrics=None, n_jobs=1
 ):
@@ -2441,6 +2442,12 @@ class ImmutableDataFrame:
         df_copy = self._df.copy(deep=False)  # Create a shallow copy
         df_copy.values.flags.writeable = True  # Allow modifications
         return df_copy
+
+
+def _load_single_ticker(args):
+    optimizer, ticker, indices, data_dir = args
+    df = optimizer.load_ticker_data(ticker, date_range=indices, data_dir=data_dir)
+    return ticker, df
 
 
 def get_ticker_filenames(data_dir):
