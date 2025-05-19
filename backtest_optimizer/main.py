@@ -1152,11 +1152,6 @@ class ParameterOptimizer:
             data_dir (str): Directory containing data files
             params (dict): Initial parameters for the optimization.
             optimizer_params (dict): Internal parameters for optimization.
-            n_runs (int): Number of optimization runs.
-            best_trials_pct (float): Percentage of best trials to consider.
-            n_splits (int): Number of total splits for CPCV. Required.
-            n_test_splits (int): Number of test splits for CPCV. Required.
-            train_test_date (str, optional): If provided, limits all data to before this date.
         """
         # Start timing for overall process
         optimization_start_time = time.time()
@@ -1197,6 +1192,18 @@ class ParameterOptimizer:
             for ticker in self.data_info:
                 if self.data_info[ticker]["end_date"] > train_test_datetime:
                     self.data_info[ticker]["end_date"] = train_test_datetime
+
+        if optimizer_params.get("start_date") is not None:
+            start_time = pd.Timestamp(optimizer_params["start_date"])
+            logging.info(
+                f"Limiting data to after {start_time}"
+            )
+
+            # Update data_info to limit start_date to start_time
+            for ticker in self.data_info:
+                if self.data_info[ticker]["start_date"] < start_time:
+                    self.data_info[ticker]["start_date"] = start_time
+
 
         # Store data directory path for subsequent operations
         self.params_dict["data_path"] = data_dir
