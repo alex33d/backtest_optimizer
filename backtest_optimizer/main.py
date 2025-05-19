@@ -1053,9 +1053,7 @@ class ParameterOptimizer:
                 logging.info(
                     f"Loading {len(ticker_index_pairs)} tickers using {n_workers} parallel workers"
                 )
-
-                from multiprocessing import Pool
-
+                
                 load_args = [
                     (self, ticker, indices, data_dir)
                     for ticker, indices in ticker_index_pairs.items()
@@ -1080,9 +1078,12 @@ class ParameterOptimizer:
                 info["format"] in ["csv", "csv.gz"] for info in self.data_info.values()
             ):
                 logging.info(f"Converting CSV to HDF5 for {fold_or_test}")
-                temp_dir = tempfile.mkdtemp()
+                # Create a TemporaryDirectory that will be returned and managed by the caller
+                temp_dir_obj = tempfile.TemporaryDirectory()
+                temp_dir = temp_dir_obj.name
+                
                 try:
-                    from multiprocessing import Pool
+                    
 
                     conversion_args = [
                         (self, ticker, indices, data_dir, temp_dir)
@@ -1097,14 +1098,19 @@ class ParameterOptimizer:
                             )
                         )
                     if all(results):
-                        return temp_dir
+                        # Return both the directory name and the context manager object
+                        return {"path": temp_dir, "context": temp_dir_obj}
                     else:
                         logging.error(
                             "Some conversions failed. Falling back to original data directory."
                         )
+                        # Clean up the temporary directory by allowing the context manager to go out of scope
+                        temp_dir_obj.cleanup()
                         return data_dir
                 except Exception as e:
                     logging.error(f"Failed to convert CSV to HDF5: {e}")
+                    # Clean up the temporary directory
+                    temp_dir_obj.cleanup()
                     return data_dir
             else:
                 return data_dir
@@ -1171,6 +1177,10 @@ class ParameterOptimizer:
         max_memory_gb = optimizer_params.get(
             "max_memory_gb", 1000
         )  # Default to 1000 GB (1 TB)
+        
+        # Dictionary to keep references to temporary directory context managers
+        # Using a list to store context managers for each fold 
+        temp_dir_contexts = {}
 
         # Collect data info instead of loading all data
         if not self.data_info:
@@ -1204,7 +1214,6 @@ class ParameterOptimizer:
                 if self.data_info[ticker]["start_date"] < start_time:
                     self.data_info[ticker]["start_date"] = start_time
 
-
         # Store data directory path for subsequent operations
         self.params_dict["data_path"] = data_dir
 
@@ -1227,144 +1236,180 @@ class ParameterOptimizer:
             f"Created {len(self.combcv_dict)} combinatorial splits in {splits_duration:.2f}s"
         )
 
-        # Process each combinatorial split
-        total_folds = len(self.combcv_dict)
-        for fold_idx, (fold_num, date_ranges) in enumerate(self.combcv_dict.items()):
-            fold_start_time = time.time()
-            logging.info(f"Starting fold {fold_num} ({fold_idx+1}/{total_folds})")
+        try:
+            # Process each combinatorial split
+            total_folds = len(self.combcv_dict)
+            for fold_idx, (fold_num, date_ranges) in enumerate(self.combcv_dict.items()):
+                fold_start_time = time.time()
+                logging.info(f"Starting fold {fold_num} ({fold_idx+1}/{total_folds})")
 
-            # Set current group for this fold
-            self.current_group = date_ranges
+                # Set current group for this fold
+                self.current_group = date_ranges
 
-            # Generate indices before optimization
-            group_indices = self.generate_group_indices(is_train=True)
+                # Generate indices before optimization
+                group_indices = self.generate_group_indices(is_train=True)
 
-            data_source = self.load_data_for_indices(
-                group_indices, data_dir, max_memory_gb, fold_num
-            )
+                data_source = self.load_data_for_indices(
+                    group_indices, data_dir, max_memory_gb, fold_num
+                )
+                
+                # Handle the case where data_source is a dictionary containing path and context
+                actual_data_source = data_source
+                if isinstance(data_source, dict) and "path" in data_source and "context" in data_source:
+                    # Store the context manager for cleanup later
+                    temp_dir_contexts[fold_num] = data_source["context"]
+                    # Use the path for data processing
+                    actual_data_source = data_source["path"]
 
-            # Define the objective function using combcv_pl
-            objective_func = self.create_objective(
-                group_indices,
-                self.params_dict,
-                self.calc_pl,
-                data_source,  # data type depends on memory usage
-            )
-
-            # Create and configure the Optuna study
-            pruner = RepeatPruner()
-            study = optuna.create_study(
-                direction="maximize",
-                sampler=optuna.samplers.TPESampler(multivariate=True),
-                pruner=pruner,
-            )
-
-            # Run the optimization
-            logging.info(
-                f"Running {optimizer_params.get('n_runs')} trials for fold {fold_num}"
-            )
-            study.optimize(
-                objective_func,
-                n_trials=optimizer_params.get("n_runs"),
-                n_jobs=self.n_jobs,
-            )
-            optimization_duration = time.time() - fold_start_time
-
-            if "train_data" in locals():
-                del train_data
-
-            # Process and sort trials
-            all_trials = sorted(
-                [
-                    trial
-                    for trial in study.trials
-                    if trial.value is not None
-                    and trial.state == optuna.trial.TrialState.COMPLETE
-                ],
-                key=lambda trial: trial.value,
-                reverse=True,
-            )
-
-            completed_trials = len(all_trials)
-            logging.info(
-                f"Fold {fold_num}: {completed_trials}/{optimizer_params.get('n_runs')} trials completed in {optimization_duration:.2f}s"
-            )
-
-            if completed_trials == 0:
-                logging.warning(f"Fold {fold_num}: No successfully completed trials")
-                continue
-
-            # Extract parameters from trials
-            all_trials = [trial.params for trial in all_trials]
-
-            # Fill in default parameters
-            for trial_params in all_trials:
-                for key, value in self.params_dict.items():
-                    if key not in trial_params:
-                        trial_params[key] = value
-
-            # Add to the list of all tested parameters
-            all_tested_params.extend(all_trials)
-
-            # Select top parameters based on percentage
-            top_count = max(
-                1, int(len(all_trials) * optimizer_params.get("best_trials_pct"))
-            )
-            top_params = all_trials[:top_count]
-            logging.info(
-                f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})"
-            )
-
-            # Generate test indices
-            test_indices = self.generate_group_indices(is_train=False)
-            test_data = self.load_data_for_indices(
-                test_indices, data_dir, max_memory_gb
-            )
-
-            # Evaluate top parameters on validation data
-            evaluation_start = time.time()
-            for i, trial_params in enumerate(top_params):
-                sharpe, _ = self.combcv_pl(
-                    trial_params, test_indices, self.calc_pl, test_data
+                # Define the objective function using combcv_pl
+                objective_func = self.create_objective(
+                    group_indices,
+                    self.params_dict,
+                    self.calc_pl,
+                    actual_data_source,  # Use the actual data source (path or data dict)
                 )
 
-                # Record results
-                if i == 0:
-                    trial_params["fold_num"] = fold_num
-                else:
-                    trial_params["fold_num"] = np.nan
+                # Create and configure the Optuna study
+                pruner = RepeatPruner()
+                study = optuna.create_study(
+                    direction="maximize",
+                    sampler=optuna.samplers.TPESampler(multivariate=True),
+                    pruner=pruner,
+                )
 
-                trial_params["sharpe"] = sharpe
-                result.append(trial_params)
+                # Run the optimization
                 logging.info(
-                    f"Fold {fold_num}: Parameter set {i+1}/{len(top_params)} - Test Sharpe: {sharpe:.4f}"
+                    f"Running {optimizer_params.get('n_runs')} trials for fold {fold_num}"
+                )
+                study.optimize(
+                    objective_func,
+                    n_trials=optimizer_params.get('n_runs'),
+                    n_jobs=self.n_jobs,
+                )
+                optimization_duration = time.time() - fold_start_time
+
+                if "train_data" in locals():
+                    del train_data
+
+                # Process and sort trials
+                all_trials = sorted(
+                    [
+                        trial
+                        for trial in study.trials
+                        if trial.value is not None
+                        and trial.state == optuna.trial.TrialState.COMPLETE
+                    ],
+                    key=lambda trial: trial.value,
+                    reverse=True,
                 )
 
-            evaluation_duration = time.time() - evaluation_start
-            logging.info(
-                f"Fold {fold_num}: Validation completed in {evaluation_duration:.2f}s"
-            )
-
-            # Save the best parameters for this fold
-            self.best_params_by_fold[fold_num] = top_params[0]
-
-            # Save interim results
-            if self.save_path is not None:
-                interim_df = pd.DataFrame(result).sort_values("sharpe", ascending=False)
-                if "data_path" in interim_df.columns:
-                    del interim_df["data_path"]
-
-                interim_file = (
-                    self.save_path + self.file_prefix + f"interim_fold_{fold_num}.csv"
+                completed_trials = len(all_trials)
+                logging.info(
+                    f"Fold {fold_num}: {completed_trials}/{optimizer_params.get('n_runs')} trials completed in {optimization_duration:.2f}s"
                 )
-                interim_df.to_csv(interim_file, index=False)
-                logging.info(f"Interim results saved to {interim_file}")
 
-            if "temp_dir" in locals():
-                shutil.rmtree(temp_dir)
+                if completed_trials == 0:
+                    logging.warning(f"Fold {fold_num}: No successfully completed trials")
+                    continue
 
-            fold_duration = time.time() - fold_start_time
-            logging.info(f"Completed fold {fold_num} in {fold_duration:.2f}s")
+                # Extract parameters from trials
+                all_trials = [trial.params for trial in all_trials]
+
+                # Fill in default parameters
+                for trial_params in all_trials:
+                    for key, value in self.params_dict.items():
+                        if key not in trial_params:
+                            trial_params[key] = value
+
+                # Add to the list of all tested parameters
+                all_tested_params.extend(all_trials)
+
+                # Select top parameters based on percentage
+                top_count = max(
+                    1, int(len(all_trials) * optimizer_params.get("best_trials_pct"))
+                )
+                top_params = all_trials[:top_count]
+                logging.info(
+                    f"Fold {fold_num}: Selected top {top_count} parameter sets (best Sharpe: {study.best_value:.4f})"
+                )
+
+                # Generate test indices
+                test_indices = self.generate_group_indices(is_train=False)
+                test_data = self.load_data_for_indices(
+                    test_indices, data_dir, max_memory_gb
+                )
+                
+                # Handle test data if it's a dictionary with path and context
+                if isinstance(test_data, dict) and "path" in test_data and "context" in test_data:
+                    # Store the context manager for cleanup later (use a different key)
+                    temp_dir_contexts[f"test_{fold_num}"] = test_data["context"]
+                    # Use the path for data processing
+                    test_data = test_data["path"]
+
+                # Evaluate top parameters on validation data
+                evaluation_start = time.time()
+                for i, trial_params in enumerate(top_params):
+                    sharpe, _ = self.combcv_pl(
+                        trial_params, test_indices, self.calc_pl, test_data
+                    )
+
+                    # Record results
+                    if i == 0:
+                        trial_params["fold_num"] = fold_num
+                    else:
+                        trial_params["fold_num"] = np.nan
+
+                    trial_params["sharpe"] = sharpe
+                    result.append(trial_params)
+                    logging.info(
+                        f"Fold {fold_num}: Parameter set {i+1}/{len(top_params)} - Test Sharpe: {sharpe:.4f}"
+                    )
+
+                evaluation_duration = time.time() - evaluation_start
+                logging.info(
+                    f"Fold {fold_num}: Validation completed in {evaluation_duration:.2f}s"
+                )
+
+                # Save the best parameters for this fold
+                self.best_params_by_fold[fold_num] = top_params[0]
+
+                # Save interim results
+                if self.save_path is not None:
+                    if not os.path.exists(self.save_path):
+                        os.makedirs(self.save_path)
+                    interim_df = pd.DataFrame(result).sort_values("sharpe", ascending=False)
+                    if "data_path" in interim_df.columns:
+                        del interim_df["data_path"]
+
+                    interim_file = (
+                        self.save_path + self.file_prefix + f"interim_fold_{fold_num}.csv"
+                    )
+                    interim_df.to_csv(interim_file, index=False)
+                    logging.info(f"Interim results saved to {interim_file}")
+
+                # Cleanup temporary directories for this fold
+                if fold_num in temp_dir_contexts:
+                    temp_dir_contexts[fold_num].cleanup()
+                    del temp_dir_contexts[fold_num]
+                    logging.info(f"Cleaned up temporary directory for fold {fold_num}")
+                
+                if f"test_{fold_num}" in temp_dir_contexts:
+                    temp_dir_contexts[f"test_{fold_num}"].cleanup()
+                    del temp_dir_contexts[f"test_{fold_num}"]
+                    logging.info(f"Cleaned up temporary directory for test fold {fold_num}")
+
+                fold_duration = time.time() - fold_start_time
+                logging.info(f"Completed fold {fold_num} in {fold_duration:.2f}s")
+
+        finally:
+            # Ensure all temporary directories are cleaned up
+            for key, context in list(temp_dir_contexts.items()):
+                try:
+                    context.cleanup()
+                    logging.info(f"Cleaned up temporary directory for {key}")
+                except Exception as e:
+                    logging.warning(f"Error cleaning up temporary directory for {key}: {e}")
+                del temp_dir_contexts[key]
 
         # Save final results
         self.top_params_list = result
