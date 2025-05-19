@@ -132,34 +132,40 @@ class ParameterOptimizer:
             logging.info(f"Processing group {group_num} with {ticker_count} tickers")
             group_data = {}
 
-            for ticker, indices in ticker_indices.items():
-                if isinstance(data_source, str):
-                    # Load data from directory for specific date ranges
-                    # Let load_ticker_data handle all the data loading logging
-                    df = self.load_ticker_data(
-                        ticker, date_range=indices, data_dir=data_source
-                    )
-                    if not df.empty:
-                        group_data[ticker] = df
-                    else:
-                        logging.warning(
-                            f"Group {group_num}: Got empty DataFrame for {ticker}"
+            if isinstance(data_source, str):
+                # Directory path: load data in parallel
+                load_args = [
+                    (ticker, data_source, indices)
+                    for ticker, indices in ticker_indices.items()
+                ]
+                n_workers = min(self.n_jobs, len(load_args), 32)
+                with Pool(processes=n_workers) as pool:
+                    results = list(
+                        tqdm(
+                            pool.imap(load_single_ticker, load_args),
+                            total=len(load_args),
+                            desc=f"Loading data for group {group_num}",
                         )
-                else:
-                    # Legacy mode - data already in memory
+                    )
+                group_data = {
+                    ticker: df
+                    for ticker, df in results
+                    if df is not None and not df.empty
+                }
+            else:
+                # Legacy mode: data already in memory
+                group_data = {}
+                for ticker, indices in ticker_indices.items():
                     df = data_source.get(ticker)
                     if df is None or df.empty:
                         logging.warning(
                             f"Group {group_num}: Ticker {ticker} has no data"
                         )
                         continue
-
                     if isinstance(indices, pd.DatetimeIndex):
-                        # DatetimeIndex case
                         mask = df.index.isin(indices)
                         group_data[ticker] = df.loc[mask]
                     else:
-                        # Integer indices case (legacy)
                         group_data[ticker] = df.iloc[indices]
 
             if not group_data:
@@ -1053,7 +1059,7 @@ class ParameterOptimizer:
                 logging.info(
                     f"Loading {len(ticker_index_pairs)} tickers using {n_workers} parallel workers"
                 )
-                
+
                 load_args = [
                     (self, ticker, indices, data_dir)
                     for ticker, indices in ticker_index_pairs.items()
@@ -1081,10 +1087,8 @@ class ParameterOptimizer:
                 # Create a TemporaryDirectory that will be returned and managed by the caller
                 temp_dir_obj = tempfile.TemporaryDirectory()
                 temp_dir = temp_dir_obj.name
-                
-                try:
-                    
 
+                try:
                     conversion_args = [
                         (self, ticker, indices, data_dir, temp_dir)
                         for ticker, indices in ticker_index_pairs.items()
@@ -1177,9 +1181,9 @@ class ParameterOptimizer:
         max_memory_gb = optimizer_params.get(
             "max_memory_gb", 1000
         )  # Default to 1000 GB (1 TB)
-        
+
         # Dictionary to keep references to temporary directory context managers
-        # Using a list to store context managers for each fold 
+        # Using a list to store context managers for each fold
         temp_dir_contexts = {}
 
         # Collect data info instead of loading all data
@@ -1205,9 +1209,7 @@ class ParameterOptimizer:
 
         if optimizer_params.get("start_date") is not None:
             start_time = pd.Timestamp(optimizer_params["start_date"])
-            logging.info(
-                f"Limiting data to after {start_time}"
-            )
+            logging.info(f"Limiting data to after {start_time}")
 
             # Update data_info to limit start_date to start_time
             for ticker in self.data_info:
@@ -1239,7 +1241,9 @@ class ParameterOptimizer:
         try:
             # Process each combinatorial split
             total_folds = len(self.combcv_dict)
-            for fold_idx, (fold_num, date_ranges) in enumerate(self.combcv_dict.items()):
+            for fold_idx, (fold_num, date_ranges) in enumerate(
+                self.combcv_dict.items()
+            ):
                 fold_start_time = time.time()
                 logging.info(f"Starting fold {fold_num} ({fold_idx+1}/{total_folds})")
 
@@ -1252,10 +1256,14 @@ class ParameterOptimizer:
                 data_source = self.load_data_for_indices(
                     group_indices, data_dir, max_memory_gb, fold_num
                 )
-                
+
                 # Handle the case where data_source is a dictionary containing path and context
                 actual_data_source = data_source
-                if isinstance(data_source, dict) and "path" in data_source and "context" in data_source:
+                if (
+                    isinstance(data_source, dict)
+                    and "path" in data_source
+                    and "context" in data_source
+                ):
                     # Store the context manager for cleanup later
                     temp_dir_contexts[fold_num] = data_source["context"]
                     # Use the path for data processing
@@ -1283,7 +1291,7 @@ class ParameterOptimizer:
                 )
                 study.optimize(
                     objective_func,
-                    n_trials=optimizer_params.get('n_runs'),
+                    n_trials=optimizer_params.get("n_runs"),
                     n_jobs=self.n_jobs,
                 )
                 optimization_duration = time.time() - fold_start_time
@@ -1309,7 +1317,9 @@ class ParameterOptimizer:
                 )
 
                 if completed_trials == 0:
-                    logging.warning(f"Fold {fold_num}: No successfully completed trials")
+                    logging.warning(
+                        f"Fold {fold_num}: No successfully completed trials"
+                    )
                     continue
 
                 # Extract parameters from trials
@@ -1338,9 +1348,13 @@ class ParameterOptimizer:
                 test_data = self.load_data_for_indices(
                     test_indices, data_dir, max_memory_gb
                 )
-                
+
                 # Handle test data if it's a dictionary with path and context
-                if isinstance(test_data, dict) and "path" in test_data and "context" in test_data:
+                if (
+                    isinstance(test_data, dict)
+                    and "path" in test_data
+                    and "context" in test_data
+                ):
                     # Store the context manager for cleanup later (use a different key)
                     temp_dir_contexts[f"test_{fold_num}"] = test_data["context"]
                     # Use the path for data processing
@@ -1377,12 +1391,16 @@ class ParameterOptimizer:
                 if self.save_path is not None:
                     if not os.path.exists(self.save_path):
                         os.makedirs(self.save_path)
-                    interim_df = pd.DataFrame(result).sort_values("sharpe", ascending=False)
+                    interim_df = pd.DataFrame(result).sort_values(
+                        "sharpe", ascending=False
+                    )
                     if "data_path" in interim_df.columns:
                         del interim_df["data_path"]
 
                     interim_file = (
-                        self.save_path + self.file_prefix + f"interim_fold_{fold_num}.csv"
+                        self.save_path
+                        + self.file_prefix
+                        + f"interim_fold_{fold_num}.csv"
                     )
                     interim_df.to_csv(interim_file, index=False)
                     logging.info(f"Interim results saved to {interim_file}")
@@ -1392,11 +1410,13 @@ class ParameterOptimizer:
                     temp_dir_contexts[fold_num].cleanup()
                     del temp_dir_contexts[fold_num]
                     logging.info(f"Cleaned up temporary directory for fold {fold_num}")
-                
+
                 if f"test_{fold_num}" in temp_dir_contexts:
                     temp_dir_contexts[f"test_{fold_num}"].cleanup()
                     del temp_dir_contexts[f"test_{fold_num}"]
-                    logging.info(f"Cleaned up temporary directory for test fold {fold_num}")
+                    logging.info(
+                        f"Cleaned up temporary directory for test fold {fold_num}"
+                    )
 
                 fold_duration = time.time() - fold_start_time
                 logging.info(f"Completed fold {fold_num} in {fold_duration:.2f}s")
@@ -1408,7 +1428,9 @@ class ParameterOptimizer:
                     context.cleanup()
                     logging.info(f"Cleaned up temporary directory for {key}")
                 except Exception as e:
-                    logging.warning(f"Error cleaning up temporary directory for {key}: {e}")
+                    logging.warning(
+                        f"Error cleaning up temporary directory for {key}: {e}"
+                    )
                 del temp_dir_contexts[key]
 
         # Save final results
@@ -2129,9 +2151,7 @@ class ParameterOptimizer:
             self.combcv_dict[0] = {}
             for ticker in self.data_info.keys():
                 self.combcv_dict[0][ticker] = {
-                    "train": [
-                        common_date_range
-                    ],  # Store datetime index instead of array indices
+                    "train": [common_date_range],
                     "test": None,
                 }
             return self.combcv_dict
@@ -2145,43 +2165,37 @@ class ParameterOptimizer:
             total_periods, n_splits, n_test_splits, verbose=False
         )
 
-        # Use the same cpcv_generator output for all tickers
-        for ticker in self.data_info.keys():
-            # Store the paths for later reconstruction
-            self.backtest_paths[ticker] = paths
+        # Precompute train and test datetime indices for each combination
+        combination_train_test = {}
+        for combination_num in tqdm(
+            range(is_test.shape[1]), desc="Precomputing train/test indices"
+        ):
+            train_mask = ~is_test[:, combination_num]
+            test_mask = is_test[:, combination_num]
+            train_indices = np.where(train_mask)[0]
+            test_indices = np.where(test_mask)[0]
+            train_chunks = self.split_consecutive(train_indices)
+            test_chunks = self.split_consecutive(test_indices)
+            train_datetimes = [
+                common_date_range[chunk] for chunk in train_chunks if len(chunk) > 0
+            ]
+            test_datetimes = [
+                common_date_range[chunk] for chunk in test_chunks if len(chunk) > 0
+            ]
+            combination_train_test[combination_num] = {
+                "train": train_datetimes,
+                "test": test_datetimes,
+            }
 
-            for combination_num in range(is_test.shape[1]):
+        # Assign precomputed indices to each ticker
+        for ticker in self.data_info.keys():
+            self.backtest_paths[ticker] = paths
+            for combination_num in combination_train_test:
                 if combination_num not in self.combcv_dict:
                     self.combcv_dict[combination_num] = {}
-
-                # Get boolean arrays for train and test
-                train_mask = ~is_test[:, combination_num]
-                test_mask = is_test[:, combination_num]
-
-                # Convert to indices
-                train_indices = np.where(train_mask)[0]
-                test_indices = np.where(test_mask)[0]
-
-                # Split into consecutive chunks
-                train_indices = self.split_consecutive(train_indices)
-                test_indices = self.split_consecutive(test_indices)
-
-                # Convert array indices to datetime indices
-                train_datetimes = []
-                for indices in train_indices:
-                    if len(indices) > 0:
-                        train_datetimes.append(common_date_range[indices])
-
-                test_datetimes = []
-                for indices in test_indices:
-                    if len(indices) > 0:
-                        test_datetimes.append(common_date_range[indices])
-
-                # Store datetime indices instead of array indices
-                self.combcv_dict[combination_num][ticker] = {
-                    "train": train_datetimes,
-                    "test": test_datetimes,
-                }
+                self.combcv_dict[combination_num][ticker] = combination_train_test[
+                    combination_num
+                ]
 
         # Store the mapping between indices and dates for equity curve reconstruction
         self.date_mapping = {}
