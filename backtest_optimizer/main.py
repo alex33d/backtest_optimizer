@@ -179,34 +179,34 @@ class ParameterOptimizer:
                 f"Group {group_num}: Calculating returns for {len(group_data)} tickers"
             )
             start_time = time.time()
-
             if self.use_batch_processing:
+                reference_ticker = params["reference_ticker"]
                 tickers = [t for t in group_data.keys() if t != reference_ticker]
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    # Create batch arguments, ensuring reference ticker is included
                     batch_args = []
+                    for i in range(0, len(tickers), self.batch_size):
+                        batch_params = {
+                            **params,
+                            "batch_mode": True,
+                            "temp_dir": temp_dir,
+                            "batch_id": i,
+                        }
                     for i in range(0, len(tickers), self.batch_size):
                         batch_tickers = tickers[i : i + self.batch_size]
                         batch_data = {
                             ticker: group_data[ticker] for ticker in batch_tickers
                         }
-                        batch_data[reference_ticker] = group_data[reference_ticker]
-                        batch_args.append(
-                            (batch_data, {**params, "temp_dir": temp_dir})
-                        )
+                        if reference_ticker:
+                            batch_data[reference_ticker] = group_data[reference_ticker]
+                        calc_pl_func(batch_data, batch_params)
 
-                    # Delegate computation to calc_pl_func
-                    returns = calc_pl_func(batch_args)
-
-                    # Load returns from temp directory
-                    returns_path = os.path.join(temp_dir, "final_returns.csv")
-                    if os.path.exists(returns_path):
-                        group_returns = pd.read_csv(
-                            returns_path, index_col=0, parse_dates=True
-                        ).iloc[:, 0]
-                        final_returns.append(group_returns)
-                    else:
-                        logging.warning(f"No returns generated for group {group_num}")
+                    returns_params = {
+                        **params,
+                        "batch_mode": False,
+                        "temp_dir": temp_dir,
+                    }
+                    group_returns = calc_pl_func(group_data, returns_params)
+                    final_returns.append(group_returns)
             else:
                 returns = calc_pl_func(group_data, params)
 
