@@ -105,6 +105,8 @@ class ParameterOptimizer:
         self.n_jobs = n_jobs
         self.data_info = {}  # Store metadata about data files (lengths, etc.)
         self.average_row_size_bytes = None
+        self.use_batch_processing = None
+        self.batch_size = None
 
     def combcv_pl(
         self,
@@ -177,19 +179,48 @@ class ParameterOptimizer:
                 f"Group {group_num}: Calculating returns for {len(group_data)} tickers"
             )
             start_time = time.time()
-            returns = calc_pl_func(group_data, params)
+
+            if self.use_batch_processing:
+                tickers = [t for t in group_data.keys() if t != reference_ticker]
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Create batch arguments, ensuring reference ticker is included
+                    batch_args = []
+                    for i in range(0, len(tickers), self.batch_size):
+                        batch_tickers = tickers[i : i + self.batch_size]
+                        batch_data = {
+                            ticker: group_data[ticker] for ticker in batch_tickers
+                        }
+                        batch_data[reference_ticker] = group_data[reference_ticker]
+                        batch_args.append(
+                            (batch_data, {**params, "temp_dir": temp_dir})
+                        )
+
+                    # Delegate computation to calc_pl_func
+                    returns = calc_pl_func(batch_args)
+
+                    # Load returns from temp directory
+                    returns_path = os.path.join(temp_dir, "final_returns.csv")
+                    if os.path.exists(returns_path):
+                        group_returns = pd.read_csv(
+                            returns_path, index_col=0, parse_dates=True
+                        ).iloc[:, 0]
+                        final_returns.append(group_returns)
+                    else:
+                        logging.warning(f"No returns generated for group {group_num}")
+            else:
+                returns = calc_pl_func(group_data, params)
+
+                if returns is None or returns.empty:
+                    logging.warning(
+                        f"Group {group_num}: Empty returns from calc_pl_func. Skipping."
+                    )
+                    continue
+                final_returns.append(returns)
+
             elapsed = time.time() - start_time
-
-            if returns is None or returns.empty:
-                logging.warning(
-                    f"Group {group_num}: Empty returns from calc_pl_func. Skipping."
-                )
-                continue
-
             logging.info(
-                f"Group {group_num}: Returns calculation completed in {elapsed:.2f}s, got {len(returns)} data points"
+                f"Group {group_num}: Returns calculation completed in {elapsed:.2f}s, got {len(final_returns)} data points"
             )
-            final_returns.append(returns)
 
         # Compute Sharpe ratios from each group's aggregated returns
         if not final_returns:
@@ -1165,6 +1196,9 @@ class ParameterOptimizer:
         """
         # Start timing for overall process
         optimization_start_time = time.time()
+
+        self.use_batch_processing = optimizer_params["use_batch_processing"]
+        self.batch_size = optimizer_params["batch_size"]
 
         # Log optimization parameters
         param_keys_to_optimize = [k for k, v in params.items() if isinstance(v, list)]
