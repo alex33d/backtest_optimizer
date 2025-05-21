@@ -182,31 +182,37 @@ class ParameterOptimizer:
             if self.use_batch_processing:
                 reference_ticker = params["reference_ticker"]
                 tickers = [t for t in group_data.keys() if t != reference_ticker]
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    batch_args = []
-                    for i in range(0, len(tickers), self.batch_size):
-                        batch_params = {
-                            **params,
-                            "batch_mode": True,
-                            "temp_dir": temp_dir,
-                            "batch_id": i,
-                        }
-                    for i in range(0, len(tickers), self.batch_size):
-                        batch_tickers = tickers[i : i + self.batch_size]
-                        batch_data = {
-                            ticker: group_data[ticker] for ticker in batch_tickers
-                        }
-                        if reference_ticker:
-                            batch_data[reference_ticker] = group_data[reference_ticker]
-                        calc_pl_func(batch_data, batch_params)
+                all_positions = []
+                for i in range(0, len(tickers), self.batch_size):
+                    batch_tickers = tickers[i : i + self.batch_size]
+                    batch_data = {
+                        ticker: group_data[ticker] for ticker in batch_tickers
+                    }
+                    if reference_ticker:
+                        batch_data[reference_ticker] = group_data[reference_ticker]
+                    batch_params = {
+                        **params,
+                        "raw_positions_only": True,
+                    }
+                    positions_df = calc_pl_func(batch_data, batch_params)
+                    all_positions.append(positions_df)
 
+                if all_positions:
+                    all_positions = [
+                        positions_df.reindex(group_data[reference_ticker].index)
+                        for positions_df in all_positions
+                    ]
+                    all_positions_df = pd.concat(all_positions, axis=1).fillna(0)
+                    scaled_positions_df = scale_positions_df(all_positions_df)
                     returns_params = {
                         **params,
-                        "batch_mode": False,
-                        "temp_dir": temp_dir,
+                        "scaled_positions": scaled_positions_df,
                     }
                     group_returns = calc_pl_func(group_data, returns_params)
-                    final_returns.append(group_returns)
+                    if group_returns is not None and not group_returns.empty:
+                        final_returns.append(group_returns)
+                else:
+                    logging.warning(f"No positions generated for group {group_num}")
             else:
                 returns = calc_pl_func(group_data, params)
 
@@ -2577,6 +2583,14 @@ def get_ticker_filenames(data_dir):
             ticker_files.append(ticker)
 
     return list(set(ticker_files))  # Remove duplicates
+
+
+def scale_positions_df(df):
+    array = df.to_numpy()
+    row_sums = np.abs(array.sum(axis=1))
+    mask = row_sums > 1
+    array[mask] = array[mask] / row_sums[mask][:, np.newaxis]
+    return pd.DataFrame(array, index=df.index, columns=df.columns)
 
 
 def load_single_ticker(args):
