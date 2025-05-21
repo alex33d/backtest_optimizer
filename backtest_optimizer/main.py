@@ -81,7 +81,12 @@ def calc_returns(args):
 
 class ParameterOptimizer:
     def __init__(
-        self, calc_pl: callable, save_path: str, save_file_prefix: str, n_jobs: int
+        self,
+        calc_pl: callable,
+        save_path: str,
+        save_file_prefix: str,
+        n_jobs: int,
+        scale_pos_func: callable = None,
     ):
         """
         Initialize the parameter optimizer.
@@ -107,6 +112,7 @@ class ParameterOptimizer:
         self.average_row_size_bytes = None
         self.use_batch_processing = None
         self.batch_size = None
+        self.scale_pos_func = scale_pos_func
 
     def combcv_pl(
         self,
@@ -203,7 +209,7 @@ class ParameterOptimizer:
                         for positions_df in all_positions
                     ]
                     all_positions_df = pd.concat(all_positions, axis=1).fillna(0)
-                    scaled_positions_df = scale_positions_df(all_positions_df)
+                    scaled_positions_df = self.scale_pos_func(all_positions_df)
                     returns_params = {
                         **params,
                         "scaled_positions": scaled_positions_df,
@@ -2583,14 +2589,6 @@ def get_ticker_filenames(data_dir):
             ticker_files.append(ticker)
 
     return list(set(ticker_files))  # Remove duplicates
-
-
-def scale_positions_df(df):
-    array = df.to_numpy()
-    row_sums = np.abs(array.sum(axis=1))
-    mask = row_sums > 1
-    array[mask] = array[mask] / row_sums[mask][:, np.newaxis]
-    return pd.DataFrame(array, index=df.index, columns=df.columns)
 
 
 def load_single_ticker(args):
