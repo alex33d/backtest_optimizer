@@ -137,101 +137,137 @@ class ParameterOptimizer:
         for group_num, ticker_indices in group_indices.items():
             ticker_count = len(ticker_indices)
             logging.info(f"Processing group {group_num} with {ticker_count} tickers")
-            group_data = {}
 
-            if isinstance(data_source, str):
-                # Directory path: load data in parallel
-                load_args = [
-                    (ticker, data_source, indices)
-                    for ticker, indices in ticker_indices.items()
-                ]
-                n_workers = min(self.n_jobs, len(load_args), 32)
-                with Pool(processes=n_workers) as pool:
-                    results = list(
-                        tqdm(
-                            pool.imap(load_single_ticker, load_args),
-                            total=len(load_args),
-                            desc=f"Loading data for group {group_num}",
+            if self.use_batch_processing:
+                reference_ticker = params.get("reference_ticker")
+                tickers = [t for t in ticker_indices.keys() if t != reference_ticker]
+
+                # Create a temporary directory to store position files
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    position_files = []
+
+                    # First pass: Calculate positions for each batch and save to disk
+                    for i in range(0, len(tickers), self.batch_size):
+                        batch_tickers = tickers[i : i + self.batch_size]
+                        batch_indices = {
+                            ticker: ticker_indices[ticker] for ticker in batch_tickers
+                        }
+                        if reference_ticker:
+                            batch_indices[reference_ticker] = ticker_indices[
+                                reference_ticker
+                            ]
+
+                        # Load data only for the current batch
+                        batch_data = self.load_data_for_batch(
+                            batch_indices, data_source
                         )
-                    )
-                group_data = {
-                    ticker: df
-                    for ticker, df in results
-                    if df is not None and not df.empty
-                }
-            else:
-                # Legacy mode: data already in memory
-                group_data = {}
-                for ticker, indices in ticker_indices.items():
-                    df = data_source.get(ticker)
-                    if df is None or df.empty:
+
+                        if not batch_data:
+                            logging.warning(
+                                f"Batch {i} in group {group_num}: No valid data. Skipping."
+                            )
+                            continue
+
+                        # Calculate positions for this batch
+                        batch_params = {
+                            **params,
+                            "raw_positions_only": True,
+                        }
+                        positions_df = self.calc_pl(batch_data, batch_params)
+
+                        if positions_df is None or positions_df.empty:
+                            logging.warning(
+                                f"Batch {i} in group {group_num}: No positions generated. Skipping."
+                            )
+                            continue
+
+                        # Save positions to a parquet file
+                        position_file = os.path.join(
+                            temp_dir, f"positions_batch_{i}.parquet"
+                        )
+                        positions_df.to_parquet(position_file)
+                        position_files.append(position_file)
+
+                    if not position_files:
                         logging.warning(
-                            f"Group {group_num}: Ticker {ticker} has no data"
+                            f"Group {group_num}: No positions generated for any batch. Skipping."
                         )
                         continue
-                    if isinstance(indices, pd.DatetimeIndex):
-                        mask = df.index.isin(indices)
-                        group_data[ticker] = df.loc[mask]
-                    else:
-                        group_data[ticker] = df.iloc[indices]
 
-            if not group_data:
-                logging.warning(f"Group {group_num}: No valid tickers. Skipping.")
-                continue
-
-            # Calculate returns for this group
-            logging.info(
-                f"Group {group_num}: Calculating returns for {len(group_data)} tickers"
-            )
-            start_time = time.time()
-            if self.use_batch_processing:
-                reference_ticker = params["reference_ticker"]
-                tickers = [t for t in group_data.keys() if t != reference_ticker]
-                all_positions = []
-                for i in range(0, len(tickers), self.batch_size):
-                    batch_tickers = tickers[i : i + self.batch_size]
-                    batch_data = {
-                        ticker: group_data[ticker] for ticker in batch_tickers
-                    }
-                    if reference_ticker:
-                        batch_data[reference_ticker] = group_data[reference_ticker]
-                    batch_params = {
-                        **params,
-                        "raw_positions_only": True,
-                    }
-                    positions_df = self.calc_pl(batch_data, batch_params)
-                    all_positions.append(positions_df)
-
-                if all_positions:
-                    all_positions = [
-                        positions_df.reindex(group_data[reference_ticker].index)
-                        for positions_df in all_positions
-                    ]
+                    # Load all positions from disk and scale them
+                    all_positions = [pd.read_parquet(file) for file in position_files]
                     all_positions_df = pd.concat(all_positions, axis=1).fillna(0)
                     scaled_positions_df = self.scale_pos_func(all_positions_df)
-                    returns_params = {
-                        **params,
-                        "scaled_positions": scaled_positions_df,
-                    }
-                    group_returns = self.calc_pl(group_data, returns_params)
-                    if group_returns is not None and not group_returns.empty:
-                        final_returns.append(group_returns)
-                else:
-                    logging.warning(f"No positions generated for group {group_num}")
+
+                    # Second pass: Calculate returns for each batch using scaled positions
+                    final_returns = []
+                    for i in range(0, len(tickers), self.batch_size):
+                        batch_tickers = tickers[i : i + self.batch_size]
+                        batch_indices = {
+                            ticker: ticker_indices[ticker] for ticker in batch_tickers
+                        }
+                        if reference_ticker:
+                            batch_indices[reference_ticker] = ticker_indices[
+                                reference_ticker
+                            ]
+
+                        # Load data for the batch again
+                        batch_data = self.load_data_for_batch(
+                            batch_indices, data_source
+                        )
+
+                        if not batch_data:
+                            logging.warning(
+                                f"Batch {i} in group {group_num}: No valid data for returns. Skipping."
+                            )
+                            continue
+
+                        # Extract scaled positions for this batch
+                        batch_scaled_positions = scaled_positions_df[
+                            [
+                                f"Position_{ticker}"
+                                for ticker in batch_tickers
+                                if f"Position_{ticker}" in scaled_positions_df.columns
+                            ]
+                        ]
+
+                        # Calculate returns using scaled positions
+                        returns_params = {
+                            **params,
+                            "scaled_positions": batch_scaled_positions,
+                        }
+                        group_returns = self.calc_pl(batch_data, returns_params)
+
+                        if group_returns is not None and not group_returns.empty:
+                            final_returns.append(group_returns)
+                        else:
+                            logging.warning(
+                                f"Batch {i} in group {group_num}: No returns generated."
+                            )
+
+                    if final_returns:
+                        # Sum returns from all batches
+                        final_group_returns = pd.concat(final_returns, axis=1).sum(
+                            axis=1
+                        )
+                        final_returns.append(final_group_returns)
+                    else:
+                        logging.warning(
+                            f"Group {group_num}: No returns generated for any batch."
+                        )
             else:
-                returns = self.calc_pl(group_data, params)
-
-                if returns is None or returns.empty:
-                    logging.warning(
-                        f"Group {group_num}: Empty returns from calc_pl. Skipping."
-                    )
+                # Non-batch processing: Load data for the entire group
+                group_data = self.load_data_for_group(ticker_indices, data_source)
+                if not group_data:
+                    logging.warning(f"Group {group_num}: No valid tickers. Skipping.")
                     continue
-                final_returns.append(returns)
 
-            elapsed = time.time() - start_time
-            logging.info(
-                f"Group {group_num}: Returns calculation completed in {elapsed:.2f}s, got {len(final_returns)} data points"
-            )
+                # Calculate returns directly
+                returns = self.calc_pl(group_data, params)
+                if returns is not None and not returns.empty:
+                    final_returns.append(returns)
+                else:
+                    logging.warning(f"Group {group_num}: No returns generated.")
 
         # Compute Sharpe ratios from each group's aggregated returns
         if not final_returns:
@@ -260,6 +296,73 @@ class ParameterOptimizer:
             f"Final mean Sharpe ratio: {final_sharpe:.4f} (across {len(sharpe_ratios)} groups)"
         )
         return final_sharpe, final_returns
+
+    def load_data_for_batch(self, batch_indices, data_source):
+        batch_data = {}
+        if isinstance(data_source, str):
+            # Directory path: load data in parallel
+            load_args = [
+                (ticker, data_source, indices)
+                for ticker, indices in batch_indices.items()
+            ]
+            n_workers = min(self.n_jobs, len(load_args), 32)
+            with Pool(processes=n_workers) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap(load_single_ticker, load_args),
+                        total=len(load_args),
+                        desc="Loading data for batch",
+                    )
+                )
+            batch_data = {
+                ticker: df for ticker, df in results if df is not None and not df.empty
+            }
+        else:
+            # Legacy mode: data already in memory
+            for ticker, indices in batch_indices.items():
+                df = data_source.get(ticker)
+                if df is None or df.empty:
+                    logging.warning(f"Batch: Ticker {ticker} has no data")
+                    continue
+                if isinstance(indices, pd.DatetimeIndex):
+                    mask = df.index.isin(indices)
+                    batch_data[ticker] = df.loc[mask]
+                else:
+                    batch_data[ticker] = df.iloc[indices]
+        return batch_data
+
+    # Helper function to load data for a group (used when not batching)
+    def load_data_for_group(self, ticker_indices, data_source):
+        group_data = {}
+        if isinstance(data_source, str):
+            load_args = [
+                (ticker, data_source, indices)
+                for ticker, indices in ticker_indices.items()
+            ]
+            n_workers = min(self.n_jobs, len(load_args), 32)
+            with Pool(processes=n_workers) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap(load_single_ticker, load_args),
+                        total=len(load_args),
+                        desc="Loading data for group",
+                    )
+                )
+            group_data = {
+                ticker: df for ticker, df in results if df is not None and not df.empty
+            }
+        else:
+            for ticker, indices in ticker_indices.items():
+                df = data_source.get(ticker)
+                if df is None or df.empty:
+                    logging.warning(f"Ticker {ticker} has no data")
+                    continue
+                if isinstance(indices, pd.DatetimeIndex):
+                    mask = df.index.isin(indices)
+                    group_data[ticker] = df.loc[mask]
+                else:
+                    group_data[ticker] = df.iloc[indices]
+        return group_data
 
     def create_objective(self, group_indices, params_dict, data_source):
         """
@@ -290,9 +393,7 @@ class ParameterOptimizer:
                     )
                     raise optuna.TrialPruned()
 
-                sharpe, _ = self.combcv_pl(
-                    trial_params, group_indices, data_source
-                )
+                sharpe, _ = self.combcv_pl(trial_params, group_indices, data_source)
                 if np.isnan(sharpe):
                     logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
                     return -1e6
@@ -1407,9 +1508,7 @@ class ParameterOptimizer:
                 # Evaluate top parameters on validation data
                 evaluation_start = time.time()
                 for i, trial_params in enumerate(top_params):
-                    sharpe, _ = self.combcv_pl(
-                        trial_params, test_indices, test_data
-                    )
+                    sharpe, _ = self.combcv_pl(trial_params, test_indices, test_data)
 
                     # Record results
                     if i == 0:
@@ -1829,9 +1928,7 @@ class ParameterOptimizer:
 
                 # Use combcv_pl to get returns
                 if test_group:
-                    _, returns_list = self.combcv_pl(
-                        params, test_group, data_dir
-                    )
+                    _, returns_list = self.combcv_pl(params, test_group, data_dir)
 
                     if returns_list:
                         # Combine returns from all groups (usually just one for test data)
