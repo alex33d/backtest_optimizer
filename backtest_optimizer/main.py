@@ -66,9 +66,9 @@ class RepeatPruner(BasePruner):
 
 
 def calc_returns(args):
-    calc_pl_func, params, train_data = args
+    optimizer, params, train_data = args
     try:
-        returns = calc_pl_func(train_data, params)
+        returns = optimizer.calc_pl(train_data, params)
     except Exception as e:
         logging.info(
             f"PL calculation for stress tests failed for {params}, with error {e}"
@@ -118,7 +118,6 @@ class ParameterOptimizer:
         self,
         params: dict,
         group_indices: dict,
-        calc_pl_func: callable,
         data_source: dict,
     ) -> tuple:
         """
@@ -200,7 +199,7 @@ class ParameterOptimizer:
                         **params,
                         "raw_positions_only": True,
                     }
-                    positions_df = calc_pl_func(batch_data, batch_params)
+                    positions_df = self.calc_pl(batch_data, batch_params)
                     all_positions.append(positions_df)
 
                 if all_positions:
@@ -214,17 +213,17 @@ class ParameterOptimizer:
                         **params,
                         "scaled_positions": scaled_positions_df,
                     }
-                    group_returns = calc_pl_func(group_data, returns_params)
+                    group_returns = self.calc_pl(group_data, returns_params)
                     if group_returns is not None and not group_returns.empty:
                         final_returns.append(group_returns)
                 else:
                     logging.warning(f"No positions generated for group {group_num}")
             else:
-                returns = calc_pl_func(group_data, params)
+                returns = self.calc_pl(group_data, params)
 
                 if returns is None or returns.empty:
                     logging.warning(
-                        f"Group {group_num}: Empty returns from calc_pl_func. Skipping."
+                        f"Group {group_num}: Empty returns from calc_pl. Skipping."
                     )
                     continue
                 final_returns.append(returns)
@@ -262,7 +261,7 @@ class ParameterOptimizer:
         )
         return final_sharpe, final_returns
 
-    def create_objective(self, group_indices, params_dict, calc_pl_func, data_source):
+    def create_objective(self, group_indices, params_dict, data_source):
         """
         Create an objective function that passes data_source to combcv_pl.
         """
@@ -292,7 +291,7 @@ class ParameterOptimizer:
                     raise optuna.TrialPruned()
 
                 sharpe, _ = self.combcv_pl(
-                    trial_params, group_indices, calc_pl_func, data_source
+                    trial_params, group_indices, data_source
                 )
                 if np.isnan(sharpe):
                     logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
@@ -1319,7 +1318,6 @@ class ParameterOptimizer:
                 objective_func = self.create_objective(
                     group_indices,
                     self.params_dict,
-                    self.calc_pl,
                     actual_data_source,  # Use the actual data source (path or data dict)
                 )
 
@@ -1338,7 +1336,7 @@ class ParameterOptimizer:
                 study.optimize(
                     objective_func,
                     n_trials=optimizer_params.get("n_runs"),
-                    n_jobs=self.n_jobs,
+                    n_jobs=optimizer_params.get("n_jobs", 1),
                 )
                 optimization_duration = time.time() - fold_start_time
 
@@ -1410,7 +1408,7 @@ class ParameterOptimizer:
                 evaluation_start = time.time()
                 for i, trial_params in enumerate(top_params):
                     sharpe, _ = self.combcv_pl(
-                        trial_params, test_indices, self.calc_pl, test_data
+                        trial_params, test_indices, test_data
                     )
 
                     # Record results
@@ -1832,7 +1830,7 @@ class ParameterOptimizer:
                 # Use combcv_pl to get returns
                 if test_group:
                     _, returns_list = self.combcv_pl(
-                        params, test_group, self.calc_pl, data_dir
+                        params, test_group, data_dir
                     )
 
                     if returns_list:
@@ -1960,7 +1958,7 @@ class ParameterOptimizer:
             process_combination,
             data_dir=data_dir,
             param_names=param_names,
-            calc_pl=self.calc_pl,
+            optimizer=self,
             calculate_metrics=calculate_metrics,
             n_jobs=self.n_jobs,  # Pass n_jobs from the class
         )
@@ -1979,7 +1977,7 @@ class ParameterOptimizer:
                 process_combination,
                 data_dir=data_dir,
                 param_names=param_names,
-                calc_pl=self.calc_pl,
+                optimizer=self,
                 calculate_metrics=calculate_metrics,
                 n_jobs=n_data_jobs,  # Use a portion of available cores for data loading
             )
@@ -2337,7 +2335,7 @@ def convert_to_hdf5(args):
 
 
 def process_combination(
-    combination, data_dir, param_names, calc_pl=None, calculate_metrics=None, n_jobs=1
+    combination, data_dir, param_names, optimizer=None, calculate_metrics=None, n_jobs=1
 ):
     """
     Process a parameter combination for the backtest.
@@ -2346,7 +2344,7 @@ def process_combination(
         combination (tuple): Parameter combination to test.
         data_dir (str): Directory with data files.
         param_names (list): List of parameter names.
-        calc_pl (callable, optional): Function to calculate returns.
+        optimizer (ParameterOptimizer, optional): Optimizer instance with calc_pl method.
         calculate_metrics (callable, optional): Function to calculate additional metrics.
         n_jobs (int): Number of parallel workers for data loading.
 
@@ -2358,14 +2356,11 @@ def process_combination(
     logging.info(f"Processing parameter combination: {params}")
 
     try:
-        # Create temporary ParameterOptimizer for this combination
-        optimizer = ParameterOptimizer(
-            calc_pl=calc_pl,
-            calculate_metrics=calculate_metrics,
-            save_path="",  # Temporary instance doesn't need paths
-            save_file_prefix="",
-            n_jobs=n_jobs,
-        )
+        # Use the optimizer instance passed in, or create a temporary one if needed
+        temp_optimizer = None
+        if optimizer is None:
+            # Create temporary ParameterOptimizer for this combination
+            raise ValueError("optimizer parameter must be provided")
 
         # Get ticker files
         ticker_files = get_ticker_filenames(data_dir)
