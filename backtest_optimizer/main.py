@@ -393,19 +393,15 @@ class ParameterOptimizer:
         return final_sharpe, final_returns
 
     def create_objective(self, group_indices, params_dict, data_source):
+        # Define condition for parameters that should be optimized
+        def should_optimize(value):
+            return (isinstance(value, Iterable) and
+                    not isinstance(value, (str, bytes, pd.DataFrame, pd.Series)) and
+                    len(value) > 1)
+        
         # 1) Partition params into fixed vs. to-be-optimized
-        fixed_params = {
-            k: v
-            for k, v in params_dict.items()
-            if not (isinstance(v, Iterable) and
-                    not isinstance(v, (str, bytes, pd.DataFrame, pd.Series)))
-        }
-        search_space = {
-            k: v
-            for k, v in params_dict.items()
-            if isinstance(v, Iterable) and
-            not isinstance(v, (str, bytes, pd.DataFrame, pd.Series))
-        }
+        fixed_params = {k: v for k, v in params_dict.items() if not should_optimize(v)}
+        search_space = {k: v for k, v in params_dict.items() if should_optimize(v)}
 
         def objective(trial):
             # 2) Start with your fixed params…
