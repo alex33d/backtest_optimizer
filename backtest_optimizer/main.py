@@ -186,6 +186,7 @@ class ParameterOptimizer:
                     f"Group {group_num}: Calculating returns for {len(group_data)} tickers"
                 )
                 returns = self.calc_pl(group_data, params)
+                returns.to_csv("rets_no_batch.csv")
                 if returns is not None and not returns.empty:
                     final_returns.append(returns)
                 else:
@@ -244,6 +245,8 @@ class ParameterOptimizer:
                         main_end = end_date + pd.Timedelta(
                             minutes=1
                         )  # Ensure inclusion of end_date
+                    if k == 0:
+                        main_start = start_date
                     main_period = common_index[
                         (common_index >= main_start) & (common_index < main_end)
                     ]
@@ -343,13 +346,20 @@ class ParameterOptimizer:
                 # Aggregate batch returns for the group
                 if group_returns_list:
                     group_returns = pd.concat(group_returns_list, axis=0)
-                    # Remove duplicates due to potential overlaps
+                    # Ensure it's a Series, sort by index, and keep first occurrence of duplicates
+                    if not isinstance(group_returns, pd.Series):
+                        logging.warning(
+                            f"Group {group_num}: Concatenated returns is not a Series"
+                        )
+                        continue
+                    group_returns = group_returns.sort_index()
                     group_returns = group_returns[
                         ~group_returns.index.duplicated(keep="first")
                     ]
+                    group_returns.to_csv("rets_batch.csv")
                     final_returns.append(group_returns)
                     logging.info(
-                        f"Group {group_num}: Aggregated {len(group_returns)} returns"
+                        f"Group {group_num}: Aggregated {len(group_returns)} unique returns"
                     )
                 else:
                     logging.warning(
