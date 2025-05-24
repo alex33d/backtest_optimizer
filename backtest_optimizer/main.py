@@ -401,7 +401,7 @@ class ParameterOptimizer:
             try:
                 trial_params = {}
                 for k, v in params_dict.items():
-                    if not isinstance(v, Iterable) or isinstance(v, (str, bytes)):
+                    if not isinstance(v, Iterable) or isinstance(v, (str, bytes, pd.DataFrame, pd.Series)):
                         trial_params[k] = v
                     else:
                         trial_params[k] = trial.suggest_categorical(k, v)
