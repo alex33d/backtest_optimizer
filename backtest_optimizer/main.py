@@ -85,7 +85,6 @@ class ParameterOptimizer:
         calc_pl: callable,
         save_path: str,
         save_file_prefix: str,
-        n_jobs: int,
         scale_pos_func: callable = None,
     ):
         """
@@ -107,7 +106,6 @@ class ParameterOptimizer:
         self.data_dict = {}
         self.save_path = save_path
         self.file_prefix = save_file_prefix
-        self.n_jobs = n_jobs
         self.data_info = {}  # Store metadata about data files (lengths, etc.)
         self.average_row_size_bytes = None
         self.use_batch_processing = None
@@ -1345,11 +1343,12 @@ class ParameterOptimizer:
         self.use_batch_processing = optimizer_params["use_batch_processing"]
         self.warmup_period = optimizer_params["warmup_period"]
         self.index_batch_size = optimizer_params["index_batch_size"]
+        self.n_jobs = optimizer_params["n_jobs"]
 
         # Log optimization parameters
         param_keys_to_optimize = [k for k, v in params.items() if isinstance(v, list)]
         logging.info(
-            f"Starting optimization with {optimizer_params.get('n_runs')} trials per fold and {len(param_keys_to_optimize)} parameters to optimize"
+            f"Starting optimization with {self.n_jobs} jobs, {optimizer_params.get('n_runs')} trials per fold and {len(param_keys_to_optimize)} parameters to optimize"
         )
         if param_keys_to_optimize:
             logging.info(f"Parameters to optimize: {param_keys_to_optimize}")
@@ -1469,7 +1468,7 @@ class ParameterOptimizer:
                 study.optimize(
                     objective_func,
                     n_trials=optimizer_params.get("n_runs"),
-                    n_jobs=optimizer_params.get("n_jobs", 1),
+                    n_jobs=optimizer_params.get("n_jobs_optuna", 1),
                 )
                 optimization_duration = time.time() - fold_start_time
 
