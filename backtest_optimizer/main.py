@@ -393,46 +393,44 @@ class ParameterOptimizer:
         return final_sharpe, final_returns
 
     def create_objective(self, group_indices, params_dict, data_source):
-        """
-        Create an objective function that passes data_source to combcv_pl.
-        """
+        # 1) Partition params into fixed vs. to-be-optimized
+        fixed_params = {
+            k: v
+            for k, v in params_dict.items()
+            if not (isinstance(v, Iterable) and
+                    not isinstance(v, (str, bytes, pd.DataFrame, pd.Series)))
+        }
+        search_space = {
+            k: v
+            for k, v in params_dict.items()
+            if isinstance(v, Iterable) and
+            not isinstance(v, (str, bytes, pd.DataFrame, pd.Series))
+        }
 
         def objective(trial):
-            try:
-                trial_params = {}
-                for k, v in params_dict.items():
-                    if not isinstance(v, Iterable) or isinstance(v, (str, bytes, pd.DataFrame, pd.Series)):
-                        trial_params[k] = v
-                    else:
-                        trial_params[k] = trial.suggest_categorical(k, v)
+            # 2) Start with your fixed params…
+            trial_params = fixed_params.copy()
 
-                # Check for duplicate parameters
-                current_params = trial.params
-                existing_trials = trial.study.get_trials(deepcopy=False)
-                completed_trials = [
-                    t
-                    for t in existing_trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                ]
-                existing_params = [t.params for t in completed_trials]
-                if current_params in existing_params:
-                    logging.info(
-                        f"Pruning trial {trial.number} due to duplicate parameters: {trial_params}"
-                    )
-                    raise optuna.TrialPruned()
+            # 3) …and only suggest over the actual lists
+            for k, choices in search_space.items():
+                trial_params[k] = trial.suggest_categorical(k, choices)
 
-                sharpe, _ = self.combcv_pl(trial_params, group_indices, data_source)
-                if np.isnan(sharpe):
-                    logging.warning(f"Trial {trial.number} returned NaN Sharpe ratio.")
-                    return -1e6
-                return sharpe
-            except optuna.TrialPruned:
-                raise
-            except Exception as e:
-                logging.exception(f"Error in trial {trial.number}: {e}")
-                return -1e6
+            # 4) (Optional) if you want to prune duplicates, compare only the tuned keys:
+            existing = [
+            {kk: t.params[kk] for kk in search_space}
+            for t in trial.study.get_trials(deepcopy=False)
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+            current = {kk: trial_params[kk] for kk in search_space}
+            if current in existing:
+                raise optuna.TrialPruned()
+
+            # 5) Finally call your combcv_pl exactly as before
+            sharpe, _ = self.combcv_pl(trial_params, group_indices, data_source)
+            return np.nan if np.isnan(sharpe) else sharpe
 
         return objective
+
 
     def collect_data_info(self, data_dir: str, file_pattern: str = None):
         """
